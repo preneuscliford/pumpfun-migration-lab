@@ -69,13 +69,51 @@ function printHistogram(values, bins) {
   }
 }
 
-function compareFeature(name, migrated, nonMigrated, extractor) {
-  const mVals = migrated.map(extractor).filter((v) => v !== null && v !== undefined);
-  const nVals = nonMigrated.map(extractor).filter((v) => v !== null && v !== undefined);
-  console.log(
-    `  ${name.padEnd(32)} migrés: moy=${fmt(mean(mVals))} méd=${fmt(median(mVals))} (n=${mVals.length})` +
-      `  |  non-migrés: moy=${fmt(mean(nVals))} méd=${fmt(median(nVals))} (n=${nVals.length})`
-  );
+// Tranches de délai de migration — bornes fournies explicitement (pas
+// dérivées de la distribution observée), (min, max].
+const DELAY_BUCKETS = [
+  { label: '≤10s', min: -Infinity, max: 10 },
+  { label: '10s-1min', min: 10, max: 60 },
+  { label: '1-5min', min: 60, max: 300 },
+  { label: '5-15min', min: 300, max: 900 },
+  { label: '>15min', min: 900, max: Infinity },
+];
+
+function bucketFor(ttmSeconds) {
+  return DELAY_BUCKETS.find((b) => ttmSeconds > b.min && ttmSeconds <= b.max);
+}
+
+function distStats(values) {
+  const clean = values.filter((v) => v !== null && v !== undefined && !Number.isNaN(v));
+  return { n: clean.length, mean: mean(clean), median: median(clean), p25: percentile(clean, 25), p75: percentile(clean, 75) };
+}
+
+function fmtDistStats(s) {
+  if (!s.n) return 'n=0';
+  return `n=${String(s.n).padStart(3)}  méd=${fmt(s.median, 2).padStart(10)}  (P25=${fmt(s.p25, 2)} P75=${fmt(s.p75, 2)})  moy=${fmt(s.mean, 2)}`;
+}
+
+// Extrait un champ numérique directement du JSON brut de l'événement de
+// création — pas besoin de l'avoir prévu comme colonne dédiée à
+// l'ingestion, c'est exactement le rôle de raw_new_token_event (voir
+// README). solAmount/initialBuy ne sont PAS des colonnes du schéma.
+function rawNumField(t, field) {
+  const raw = t.raw_new_token_event;
+  if (!raw || raw[field] === undefined || raw[field] === null) return null;
+  const n = Number(raw[field]);
+  return Number.isNaN(n) ? null : n;
+}
+
+// Compare la distribution (pas seulement la moyenne) d'une feature entre
+// chaque tranche de délai de migration ET les non-migrés — c'est la vraie
+// question posée : les migrations ultra-rapides étaient-elles déjà
+// statistiquement différentes à la création, séparément des migrations
+// lentes et des non-migrés ?
+function printFeatureDistribution(name, groups) {
+  console.log(`\n  ${name} :`);
+  for (const g of groups) {
+    console.log(`    ${g.label.padEnd(12)} ${fmtDistStats(distStats(g.values))}`);
+  }
 }
 
 async function main() {
@@ -132,13 +170,69 @@ async function main() {
   // on attend un échantillon bien plus grand (100+ migrations) avant de
   // figer des seuils, pour ne pas contaminer la collecte avec nos
   // premières impressions.
+  //
+  // Pareil pour toute règle de décision ("capital > X -> intéressant") :
+  // hors scope tant qu'on n'a pas de quoi faire une vraie validation
+  // hors échantillon (découverte sur ~80% des données, test sur les 20%
+  // restants, idéalement en split CHRONOLOGIQUE — jours 1..N pour
+  // l'hypothèse, jours N+1..N+2 pour la tester). Avec 21 migrations,
+  // n'importe quel seuil "trouvé" serait de l'overfitting pur. On vise au
+  // moins quelques centaines de migrations avant d'envisager ce split.
 
-  console.log('\nComparaison migrés vs non-migrés (features statiques à la création) :');
-  console.log('  (échantillon encore petit — repère, pas une conclusion statistique)');
-  compareFeature('initial_market_cap_sol', migrated, nonMigrated, (t) => t.initial_market_cap_sol);
-  compareFeature('initial_virtual_sol_reserves', migrated, nonMigrated, (t) => t.initial_virtual_sol_reserves);
-  compareFeature('initial_virtual_token_reserves', migrated, nonMigrated, (t) => t.initial_virtual_token_reserves);
-  console.log('  (has_twitter/has_telegram/has_website : non renseigné en V1, pas encore comparable)');
+  console.log('\nDistribution des features à la création, par tranche de délai de migration + non-migrés :');
+  console.log('  (échantillon encore petit, surtout par tranche — repère, pas une conclusion statistique)');
+
+  const bucketGroups = DELAY_BUCKETS.map((b) => ({
+    label: b.label,
+    tokens: migrated.filter((t) => t.time_to_migration_seconds !== null && t.time_to_migration_seconds !== undefined && bucketFor(t.time_to_migration_seconds) === b),
+  }));
+  const allGroups = [...bucketGroups, { label: 'non-migrés', tokens: nonMigrated }];
+
+  printFeatureDistribution(
+    'initial_market_cap_sol',
+    allGroups.map((g) => ({ label: g.label, values: g.tokens.map((t) => t.initial_market_cap_sol) }))
+  );
+  printFeatureDistribution(
+    'initial_virtual_sol_reserves',
+    allGroups.map((g) => ({ label: g.label, values: g.tokens.map((t) => t.initial_virtual_sol_reserves) }))
+  );
+  printFeatureDistribution(
+    'initial_virtual_token_reserves',
+    allGroups.map((g) => ({ label: g.label, values: g.tokens.map((t) => t.initial_virtual_token_reserves) }))
+  );
+  // Pas des colonnes du schéma — extraites du JSON brut à la volée (voir
+  // rawNumField). C'est exactement le genre de champ qu'on n'avait pas
+  // prévu d'extraire à l'ingestion mais que raw_new_token_event permet de
+  // récupérer après coup.
+  printFeatureDistribution(
+    'solAmount (achat initial du créateur, en SOL)',
+    allGroups.map((g) => ({ label: g.label, values: g.tokens.map((t) => rawNumField(t, 'solAmount')) }))
+  );
+  printFeatureDistribution(
+    'initialBuy (achat initial du créateur, en tokens)',
+    allGroups.map((g) => ({ label: g.label, values: g.tokens.map((t) => rawNumField(t, 'initialBuy')) }))
+  );
+
+  console.log('\n  (has_twitter/has_telegram/has_website : non renseigné en V1, pas encore comparable)');
+
+  // is_mayhem_mode : flag booléen vu dans le JSON brut de certains
+  // événements de création (jamais documenté explicitement par nous —
+  // encore un exemple de ce que raw_new_token_event permet de creuser
+  // après coup). Comparaison en TAUX de migration, pas en distribution
+  // (c'est une variable catégorielle, pas continue).
+  const mayhemGroups = { true: [], false: [], 'n/a': [] };
+  for (const t of tokens) {
+    const raw = t.raw_new_token_event;
+    const key = raw && typeof raw.is_mayhem_mode === 'boolean' ? String(raw.is_mayhem_mode) : 'n/a';
+    mayhemGroups[key].push(t);
+  }
+  console.log('\n  is_mayhem_mode (taux de migration par valeur) :');
+  for (const key of ['true', 'false', 'n/a']) {
+    const group = mayhemGroups[key];
+    const migratedInGroup = group.filter((t) => t.migrated).length;
+    const rate = group.length ? ((migratedInGroup / group.length) * 100).toFixed(2) : 'n/a';
+    console.log(`    ${key.padEnd(12)} n=${String(group.length).padStart(4)}  migrés=${String(migratedInGroup).padStart(3)}  (${rate}%)`);
+  }
 
   const { data: log, error: logError } = await supabase.from('ingestion_log').select('event_type, at').order('at', { ascending: true });
   if (logError) throw new Error(`lecture ingestion_log: ${logError.message}`);
