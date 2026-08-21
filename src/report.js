@@ -33,6 +33,42 @@ function fmt(v, digits = 4) {
   return v === null || v === undefined || Number.isNaN(v) ? 'n/a' : v.toFixed(digits);
 }
 
+function percentile(arr, p) {
+  if (!arr.length) return null;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const idx = (p / 100) * (sorted.length - 1);
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+}
+
+// Bornes de temps rondes (pas choisies à partir de la distribution
+// observée) — uniquement pour rendre l'histogramme lisible, pas une
+// hypothèse sur où se situe un seuil intéressant.
+const HISTOGRAM_BINS_SECONDS = [30, 60, 120, 300, 600, 1800, 3600, 10800, 21600]; // 30s,1min,2min,5min,10min,30min,1h,3h,6h
+
+function formatSeconds(s) {
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${(s / 60).toFixed(s % 60 === 0 ? 0 : 1)}min`;
+  return `${(s / 3600).toFixed(1)}h`;
+}
+
+function printHistogram(values, bins) {
+  const counts = new Array(bins.length + 1).fill(0);
+  for (const v of values) {
+    const i = bins.findIndex((b) => v <= b);
+    counts[i === -1 ? bins.length : i] += 1;
+  }
+  const maxCount = Math.max(...counts, 1);
+  const barWidth = 40;
+  for (let i = 0; i < counts.length; i++) {
+    const label = i === 0 ? `≤${formatSeconds(bins[0])}` : i === bins.length ? `>${formatSeconds(bins[bins.length - 1])}` : `${formatSeconds(bins[i - 1])}-${formatSeconds(bins[i])}`;
+    const bar = '#'.repeat(Math.round((counts[i] / maxCount) * barWidth));
+    console.log(`    ${label.padEnd(12)} ${bar.padEnd(barWidth)} ${counts[i]}`);
+  }
+}
+
 function compareFeature(name, migrated, nonMigrated, extractor) {
   const mVals = migrated.map(extractor).filter((v) => v !== null && v !== undefined);
   const nVals = nonMigrated.map(extractor).filter((v) => v !== null && v !== undefined);
@@ -77,9 +113,25 @@ async function main() {
       `\nDélai de migration (n=${ttms.length}) : ` +
         `moyenne ${fmt(mean(ttms), 0)}s | médiane ${fmt(median(ttms), 0)}s | min ${Math.min(...ttms)}s | max ${Math.max(...ttms)}s`
     );
+    console.log(
+      '  percentiles : ' +
+        [10, 25, 50, 75, 90, 95, 99]
+          .map((p) => `P${p}=${fmt(percentile(ttms, p), 0)}s`)
+          .join(' | ')
+    );
+    console.log('  histogramme :');
+    printHistogram(ttms, HISTOGRAM_BINS_SECONDS);
   } else {
     console.log('\nAucune migration avec délai connu pour le moment.');
   }
+
+  // Taux de migration conditionnel par tranche de capital initial :
+  // délibérément PAS implémenté ici pour l'instant. Choisir les seuils de
+  // tranche à partir de la distribution qu'on est en train d'observer
+  // reviendrait à fabriquer un signal après coup plutôt qu'à le tester —
+  // on attend un échantillon bien plus grand (100+ migrations) avant de
+  // figer des seuils, pour ne pas contaminer la collecte avec nos
+  // premières impressions.
 
   console.log('\nComparaison migrés vs non-migrés (features statiques à la création) :');
   console.log('  (échantillon encore petit — repère, pas une conclusion statistique)');
