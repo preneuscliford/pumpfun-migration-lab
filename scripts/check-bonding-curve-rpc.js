@@ -10,16 +10,28 @@
 // à part entière, lecture seule sur Supabase (pour choisir un token réel
 // déjà observé) et sur le RPC Solana public. N'écrit rien nulle part.
 //
-// Hypothèses NON vérifiées avant ce test (c'est justement lui qui doit
-// les confirmer ou les infirmer) :
-// - Program ID pump.fun : 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
-// - PDA de la bonding curve dérivée des seeds ["bonding-curve", mint]
-// - Layout du compte : discriminator(8) + virtualTokenReserves(u64) +
-//   virtualSolReserves(u64) + realTokenReserves(u64) + realSolReserves(u64)
-//   + tokenTotalSupply(u64) + complete(bool)
+// Layout du compte (151 octets), confirmé via recherche (IDL public de
+// pump.fun + SDKs communautaires) et vérifié ci-dessous sur un token réel :
+//   0-7    discriminator Anchor (8 octets)
+//   8-15   virtual_token_reserves (u64)
+//   16-23  virtual_quote_reserves (u64) — = réserve SOL virtuelle pour un
+//          pool coté en SOL, d'où le renommage depuis "virtualSolReserves"
+//   24-31  real_token_reserves (u64)
+//   32-39  real_quote_reserves (u64) — idem, = réserve SOL réelle en SOL
+//   40-47  token_total_supply (u64)
+//   48     complete (1 octet, bool)
+//   49-80  creator (32 octets, pubkey)
+//   81     is_mayhem_mode (1 octet, bool)
+//   82     is_cashback_coin (1 octet, bool)
+//   83-114 quote_mint (32 octets, pubkey)
+//   115-150 padding / réservé (36 octets)
+// Program ID pump.fun : 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
+// PDA de la bonding curve dérivée des seeds ["bonding-curve", mint] — déjà
+// confirmée correcte (owner du compte retrouvé = ce program ID).
 // Si le décodage produit des valeurs incohérentes (ex. très éloignées de
-// initial_virtual_sol_reserves connu à la création), une de ces
-// hypothèses est fausse — le test le montrera, pas la peine de deviner.
+// initial_virtual_sol_reserves connu à la création, ou is_mayhem_mode qui
+// ne correspond pas à raw_new_token_event), le layout reste à revoir —
+// le test le montrera, pas la peine de deviner.
 //
 // Limite méthodologique importante : getAccountInfo ne donne que l'état
 // ACTUEL du compte. Pour un token déjà migré, c'est son état FINAL
@@ -55,34 +67,53 @@ async function rpcCall(method, params) {
   return json.result;
 }
 
-// Décode le layout supposé (voir hypothèses en tête de fichier). Retourne
+// Décode le layout confirmé (151 octets, voir en-tête du fichier). Retourne
 // un objet {error} plutôt que de planter si la taille ne correspond pas —
-// c'est en soi un résultat de test (hypothèse de layout fausse).
+// c'est en soi un résultat de test (layout encore faux ou compte différent).
+const EXPECTED_LAYOUT_BYTES = 151;
+
 function decodeBondingCurve(base64Data) {
   const buf = Buffer.from(base64Data, 'base64');
-  const expectedMin = 8 + 8 * 5 + 1;
-  if (buf.length < expectedMin) {
-    return { error: `taille inattendue: ${buf.length} octets (attendu au moins ${expectedMin})`, rawByteLength: buf.length };
+  if (buf.length < EXPECTED_LAYOUT_BYTES) {
+    return { error: `taille inattendue: ${buf.length} octets (attendu ${EXPECTED_LAYOUT_BYTES})`, rawByteLength: buf.length };
   }
-  let offset = 8; // discriminator Anchor supposé
+  let offset = 8; // discriminator Anchor
   const readU64 = () => {
     const v = buf.readBigUInt64LE(offset);
     offset += 8;
     return v;
   };
+  const readPubkey = () => {
+    const v = new PublicKey(buf.subarray(offset, offset + 32)).toBase58();
+    offset += 32;
+    return v;
+  };
   const virtualTokenReserves = readU64();
-  const virtualSolReserves = readU64();
+  const virtualQuoteReserves = readU64();
   const realTokenReserves = readU64();
-  const realSolReserves = readU64();
+  const realQuoteReserves = readU64();
   const tokenTotalSupply = readU64();
   const complete = buf.readUInt8(offset) === 1;
+  offset += 1;
+  const creator = readPubkey();
+  const isMayhemMode = buf.readUInt8(offset) === 1;
+  offset += 1;
+  const isCashbackCoin = buf.readUInt8(offset) === 1;
+  offset += 1;
+  const quoteMint = readPubkey();
   return {
-    virtualTokenReserves: virtualTokenReserves.toString(),
-    virtualSolReservesSol: Number(virtualSolReserves) / 1e9,
-    realTokenReserves: realTokenReserves.toString(),
-    realSolReservesSol: Number(realSolReserves) / 1e9,
-    tokenTotalSupply: tokenTotalSupply.toString(),
+    virtual_token_reserves: virtualTokenReserves.toString(),
+    virtual_quote_reserves: virtualQuoteReserves.toString(),
+    virtual_quote_reserves_sol: Number(virtualQuoteReserves) / 1e9,
+    real_token_reserves: realTokenReserves.toString(),
+    real_quote_reserves: realQuoteReserves.toString(),
+    real_quote_reserves_sol: Number(realQuoteReserves) / 1e9,
+    token_total_supply: tokenTotalSupply.toString(),
     complete,
+    creator,
+    is_mayhem_mode: isMayhemMode,
+    is_cashback_coin: isCashbackCoin,
+    quote_mint: quoteMint,
     rawByteLength: buf.length,
   };
 }
@@ -98,7 +129,7 @@ async function main() {
   // à inspecter dans le test 2/3.
   const { data: candidates, error } = await supabase
     .from('tokens')
-    .select('mint, symbol, created_at, migrated_at, time_to_migration_seconds, initial_virtual_sol_reserves')
+    .select('mint, symbol, created_at, migrated_at, time_to_migration_seconds, initial_virtual_sol_reserves, raw_new_token_event')
     .eq('migrated', true)
     .gt('time_to_migration_seconds', 10)
     .order('time_to_migration_seconds', { ascending: false })
@@ -110,10 +141,16 @@ async function main() {
   }
   const token = candidates[0];
 
+  const rawIsMayhemMode =
+    token.raw_new_token_event && typeof token.raw_new_token_event.is_mayhem_mode === 'boolean'
+      ? token.raw_new_token_event.is_mayhem_mode
+      : null;
+
   console.log('='.repeat(72));
   console.log(`Token choisi (groupe B, le plus lent observé) : ${token.symbol || '(sans symbole)'} — ${token.mint}`);
   console.log(`  créé ${token.created_at}, migré ${token.migrated_at} (délai ${token.time_to_migration_seconds}s)`);
   console.log(`  initial_virtual_sol_reserves connu (à la création, via PumpPortal) : ${token.initial_virtual_sol_reserves}`);
+  console.log(`  is_mayhem_mode connu (à la création, via raw_new_token_event) : ${rawIsMayhemMode === null ? 'n/a' : rawIsMayhemMode}`);
   console.log('='.repeat(72));
 
   const mintPubkey = new PublicKey(token.mint);
@@ -131,14 +168,30 @@ async function main() {
     } else {
       console.log(`  Compte trouvé. owner=${accountInfo.value.owner}`);
       const decoded = decodeBondingCurve(accountInfo.value.data[0]);
-      console.log('  Décodé (layout supposé, voir en-tête du fichier) :');
+      console.log('  Décodé (layout 151 octets, voir en-tête du fichier) :');
       console.log('   ', JSON.stringify(decoded));
-      if (decoded.complete === true) {
-        console.log('  -> complete=true, cohérent avec un token déjà migré : bon signe pour le layout supposé.');
-      } else if (decoded.error) {
-        console.log('  -> ECHEC DE DECODAGE : layout probablement faux, à revoir avant d\'aller plus loin.');
+      if (decoded.error) {
+        console.log('  -> ECHEC DE DECODAGE : layout encore faux, à revoir avant d\'aller plus loin.');
       } else {
-        console.log('  -> complete=false alors que le token est marqué migré côté PumpPortal : incohérence à investiguer (layout ou PDA probablement faux).');
+        console.log(decoded.complete === true
+          ? '  -> complete=true, cohérent avec un token déjà migré : bon signe pour le layout.'
+          : '  -> complete=false alors que le token est marqué migré côté PumpPortal : incohérence à investiguer.');
+
+        if (rawIsMayhemMode !== null) {
+          console.log(decoded.is_mayhem_mode === rawIsMayhemMode
+            ? `  -> is_mayhem_mode cohérent : ${decoded.is_mayhem_mode} (compte on-chain) === ${rawIsMayhemMode} (vu à la création).`
+            : `  -> INCOHÉRENCE is_mayhem_mode : ${decoded.is_mayhem_mode} (compte on-chain) !== ${rawIsMayhemMode} (vu à la création).`);
+        } else {
+          console.log('  -> is_mayhem_mode non disponible dans raw_new_token_event pour ce token, comparaison impossible.');
+        }
+
+        if (token.initial_virtual_sol_reserves != null) {
+          const initialSol = Number(token.initial_virtual_sol_reserves) / 1e9;
+          console.log(`  -> virtual_quote_reserves_sol actuel = ${decoded.virtual_quote_reserves_sol} SOL vs initial_virtual_sol_reserves à la création = ${initialSol} SOL (écart attendu : la réserve évolue avec les échanges, mais doit rester du même ordre de grandeur).`);
+        }
+
+        const supplyPer1e6 = Number(BigInt(decoded.token_total_supply) / 1000000n);
+        console.log(`  -> token_total_supply = ${decoded.token_total_supply} base units, soit ${supplyPer1e6.toLocaleString()} tokens à 6 décimales (attendu ~1 000 000 000 pour un supply pump.fun standard).`);
       }
     }
   } catch (err) {
