@@ -53,6 +53,19 @@ function buildFakeBondingCurveAccountBase64() {
   return buf.toString('base64');
 }
 
+// Concentration des holders (voir src/holders.js) : l'ATA de la bonding
+// curve doit être dérivée avec le VRAI programme du mint (classique ici,
+// pas Token-2022 — voir la découverte du 2026-08-21 dans holders.js), donc
+// précalculée ici pour l'inclure dans la fausse réponse getTokenLargestAccounts
+// et vérifier que le listener l'exclut correctement des holders.
+const { deriveBondingCurvePda } = require('../src/bondingCurve');
+const { deriveAta } = require('../src/holders');
+const { PublicKey } = require('@solana/web3.js');
+const CLASSIC_TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+const { pda: fakeBondingCurvePda } = deriveBondingCurvePda(fakeMint);
+const fakeCurveAta = deriveAta(fakeBondingCurvePda, new PublicKey(fakeMint), CLASSIC_TOKEN_PROGRAM_ID).toBase58();
+const fakeHolderWallet = Keypair.generate().publicKey.toBase58();
+
 const rpcRequests = [];
 const rpcServer = http.createServer((req, res) => {
   let body = '';
@@ -66,7 +79,20 @@ const rpcServer = http.createServer((req, res) => {
     }
     rpcRequests.push(parsed);
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    if (parsed.method === 'getAccountInfo') {
+    const [addressParam, optsParam] = parsed.params || [];
+    if (parsed.method === 'getAccountInfo' && optsParam?.encoding === 'jsonParsed') {
+      // Deux usages distincts derrière ce même (méthode, encodage) : lire le
+      // programme propriétaire du mint (fetchMintTokenProgram) et résoudre
+      // le propriétaire de chaque compte holder (boucle dans holders.js) —
+      // la fausse réponse sert les deux, aucun des deux ne regarde l'adresse.
+      res.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          result: { value: { owner: CLASSIC_TOKEN_PROGRAM_ID.toBase58(), data: { parsed: { info: { owner: fakeHolderWallet } } } } },
+        })
+      );
+    } else if (parsed.method === 'getAccountInfo') {
       res.end(
         JSON.stringify({
           jsonrpc: '2.0',
@@ -76,6 +102,21 @@ const rpcServer = http.createServer((req, res) => {
               owner: '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
               data: [buildFakeBondingCurveAccountBase64(), 'base64'],
             },
+          },
+        })
+      );
+    } else if (parsed.method === 'getTokenSupply') {
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { value: { amount: '1000000000000000', decimals: 6 } } }));
+    } else if (parsed.method === 'getTokenLargestAccounts') {
+      res.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          result: {
+            value: [
+              { address: fakeCurveAta, amount: '793100000000000' },
+              { address: 'FakeHolderAccount1111111111111111111111111', amount: '5000000000' },
+            ],
           },
         })
       );
@@ -150,6 +191,7 @@ async function main() {
       PUMPPORTAL_WS_URL: `ws://127.0.0.1:${wsPort}`,
       SOLANA_RPC_URL: `http://127.0.0.1:${rpcPort}`,
       BONDING_CURVE_SNAPSHOT_DELAYS_MS: '50',
+      HOLDERS_SNAPSHOT_DELAY_MS: '50',
       BONDING_CURVE_RPC_MIN_INTERVAL_MS: '10',
       MAX_RUNTIME_MS: '2500',
       RELAY_CHECK_INTERVAL_MS: '500',
@@ -224,6 +266,19 @@ async function main() {
   assert.strictEqual(snapshotRow.virtual_sol_reserves, 30); // 30000000000 lamports / 1e9, voir buildFakeBondingCurveAccountBase64
   assert.strictEqual(snapshotRow.virtual_token_reserves, '1073000000000000');
   assert.ok(typeof snapshotRow.age_seconds === 'number' && snapshotRow.age_seconds >= 0, 'age_seconds devrait être un entier positif');
+
+  // Concentration des holders : HOLDERS_SNAPSHOT_DELAY_MS=50 coïncide avec
+  // l'unique délai de snapshot testé, donc ce même snapshot doit porter les
+  // colonnes holders — vérifie que le listener a bien appelé getTokenLargestAccounts/
+  // getTokenSupply et exclu le compte de la curve (fakeCurveAta) du calcul.
+  assert.ok(
+    rpcRequests.some((r) => r.method === 'getTokenLargestAccounts'),
+    'le listener devrait avoir appelé getTokenLargestAccounts pour les holders'
+  );
+  assert.strictEqual(snapshotRow.total_supply, 1000000000000000);
+  assert.strictEqual(snapshotRow.curve_held_amount, 793100000000000, 'devrait identifier fakeCurveAta comme le compte de la curve');
+  assert.strictEqual(snapshotRow.top_holders_count, 1, 'devrait exclure fakeCurveAta et ne garder que le vrai holder');
+  assert.ok(Math.abs(snapshotRow.top_holders_pct_of_supply - 0.0005) < 1e-6, `top_holders_pct_of_supply inattendu: ${snapshotRow.top_holders_pct_of_supply}`);
 
   console.log('\nTOUS LES TESTS D\'INTEGRATION OK');
   console.log(`(${httpRequests.length} requêtes HTTP reçues, ${rpcRequests.length} requêtes RPC reçues, subscriptions=${subscriptions.join(',')}, reconnecté=${reconnected})`);

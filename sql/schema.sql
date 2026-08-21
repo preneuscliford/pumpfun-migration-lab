@@ -81,7 +81,21 @@ create table if not exists token_snapshots (
   market_cap_sol numeric,
   virtual_sol_reserves numeric,
   virtual_token_reserves numeric,
-  raw_event jsonb
+  raw_event jsonb,
+
+  -- Concentration des détenteurs (2026-08-21) : NULL sur la plupart des
+  -- lignes, rempli une seule fois par token, sur le snapshot dont le délai
+  -- correspond à HOLDERS_SNAPSHOT_DELAY_MS (30s par défaut — voir
+  -- src/listener.js et src/holders.js, même logique que
+  -- scripts/watch-axiom-candidates.js utilisé pour prototyper ça en
+  -- local). Coûte ~20 appels RPC par lecture, donc volontairement limité à
+  -- un seul point dans le temps par token plutôt qu'à chaque snapshot.
+  total_supply numeric,
+  curve_held_amount numeric,
+  top_holders_count integer,
+  top_holders_pct_of_supply numeric,
+  holders_error text,
+  holders_raw jsonb
 );
 
 create index if not exists idx_snapshots_mint_time on token_snapshots (mint, captured_at);

@@ -63,6 +63,18 @@
 // chaque match. data/ est dans .gitignore : ce sont vos observations
 // locales, pas des données du projet à publier sur le repo public.
 //
+// Écriture revue le 2026-08-21 sur retour ("on le veut à chaque fois
+// qu'un token s'ouvre") : la version précédente attendait la fin des 3
+// minutes de suivi post-match avant d'écrire quoi que ce soit, donc le
+// fichier restait vide pendant tout ce temps après un match visible en
+// console — et un Ctrl+C avant la fin perdait le match. Maintenant :
+// une ligne stage="match" est écrite IMMÉDIATEMENT à l'ouverture (avec
+// holders_at_match, sans le suivi), puis une seconde ligne
+// stage="post_match" est écrite quand le suivi de 3 minutes se termine,
+// avec le même mint/matched_at pour les recorréler, la trajectoire
+// complète et le verdict. Donc un match donne 1 ou 2 lignes selon que
+// vous laissez tourner assez longtemps — jamais 0.
+//
 // Suivi post-match ajouté sur retour terrain (2026-08-21, comparaison
 // PumpWall vs Wrixel) : "ces tokens ont des fausses pump, parfois le dev
 // sold et le token est mort, ou les top holders". Le mouvement détecté à
@@ -141,6 +153,37 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// File d'attente locale ajoutée le 2026-08-21 après avoir observé 12/12
+// holders_at_match en échec HTTP 429 (même après le retry ajouté dans
+// rpcCall) : le vrai problème n'est pas une rafale isolée au moment du
+// match, c'est le volume CUMULÉ — plusieurs candidats peuvent être
+// surveillés en parallèle (un sondage toutes les 2s chacun), et ce trafic
+// de fond suffit déjà à saturer le quota du RPC public gratuit avant même
+// que holders.js démarre sa propre rafale de ~20 appels. On espace ici
+// TOUS les appels RPC de ce script (mouvement, suivi post-match, holders)
+// derrière une seule file, au lieu de les laisser partir en parallèle
+// sans coordination — l'hypothèse initiale ("volume trop faible pour
+// avoir besoin d'un throttle partagé", voir en-tête du fichier) s'est
+// révélée fausse à l'usage. Reste local à ce script : ne touche pas au
+// rpcCall de src/bondingCurve.js utilisé par le listener de production.
+let rpcQueueTail = Promise.resolve();
+let lastRpcCallAt = 0;
+const RPC_MIN_GAP_MS = 350;
+function throttled(fn) {
+  return (...args) => {
+    const run = rpcQueueTail.then(async () => {
+      const wait = lastRpcCallAt + RPC_MIN_GAP_MS - Date.now();
+      if (wait > 0) await sleep(wait);
+      lastRpcCallAt = Date.now();
+      return fn(...args);
+    });
+    rpcQueueTail = run.catch(() => {});
+    return run;
+  };
+}
+const throttledFetchBondingCurveState = throttled((mint) => fetchBondingCurveState(SOLANA_RPC_URL, mint));
+const throttledFetchHolderConcentration = throttled((mint, bondingCurvePda) => fetchHolderConcentration(SOLANA_RPC_URL, mint, bondingCurvePda));
+
 // Écart minimum (en SOL) par rapport à l'état annoncé à la création pour
 // considérer que la bonding curve a réellement bougé. Réglé à 5 SOL sur
 // demande (2026-08-21) — bien au-dessus du bruit de quelques lamports
@@ -163,7 +206,7 @@ async function waitForMovement(mint, baselineVSol) {
   let lastState = null;
   while (Date.now() < deadline) {
     try {
-      const state = await fetchBondingCurveState(SOLANA_RPC_URL, mint);
+      const state = await throttledFetchBondingCurveState(mint);
       lastState = state;
       if (state.complete) return { state, reason: 'complete' };
       if (Number.isFinite(baselineVSol) && Math.abs(state.virtual_quote_reserves_sol - baselineVSol) >= MOVEMENT_THRESHOLD_SOL) {
@@ -193,7 +236,7 @@ async function trackPostMatch(mint, matchVSol) {
     await sleep(POST_MATCH_POLL_INTERVAL_MS);
     const t_s = Math.round((Date.now() - start) / 1000);
     try {
-      const state = await fetchBondingCurveState(SOLANA_RPC_URL, mint);
+      const state = await throttledFetchBondingCurveState(mint);
       track.push({ t_s, virtual_sol_reserves: state.virtual_quote_reserves_sol, complete: state.complete });
       if (state.complete) {
         migratedDuringTracking = true;
@@ -229,11 +272,19 @@ function computeVerdict({ baselineVSol, matchVSol, peakVSol, finalVSol, migrated
 // l'ouverture, juste ajouté aux logs/au JSONL pour votre lecture.
 // N'échoue jamais bruyamment : un problème RPC ici ne doit pas faire
 // perdre le match lui-même.
+// resolved_at ajouté le 2026-08-21 : avec le retry/backoff de
+// fetchHolderConcentration (jusqu'à ~15s cumulés sur un mint tout juste
+// créé), cette lecture peut se terminer sensiblement après l'instant du
+// match — observé en test réel sur un token qui avait déjà entièrement
+// dumpé (retour à l'état quasi vierge) quelques secondes après son match.
+// Sans ce timestamp, holders_at_match a l'air de décrire "au moment du
+// match" alors qu'il peut décrire un instant plus tardif.
 async function fetchHolderSummary(mint, bondingCurvePda) {
   try {
-    return await fetchHolderConcentration(SOLANA_RPC_URL, mint, bondingCurvePda);
+    const result = await throttledFetchHolderConcentration(mint, bondingCurvePda);
+    return { ...result, resolved_at: new Date().toISOString() };
   } catch (err) {
-    return { error: err.message };
+    return { error: err.message, resolved_at: new Date().toISOString() };
   }
 }
 
@@ -298,47 +349,58 @@ function main() {
       console.log(`[MATCH ${matched}] ${msg.symbol || '(sans symbole)'} — ${msg.mint} — ${why}`);
       console.log(`  à la création (WS) : market_cap=${marketCap} SOL  achat_créateur=${creatorBuy} SOL  vSol=${fmt(baselineVSol)}  is_mayhem_mode=${mayhem === null ? 'n/a' : mayhem}`);
       console.log(`  on-chain (RPC, maintenant) : vSol=${state.virtual_quote_reserves_sol}  vToken=${state.virtual_token_reserves}  complete=${state.complete}`);
+      console.log(`  -> ${url}${NO_OPEN ? '  (AXIOM_NO_OPEN=1 : pas ouvert)' : ''}\n`);
+      // Ouverture IMMÉDIATE, avant la lecture des holders — celle-ci peut
+      // désormais réessayer plusieurs secondes (lag d'indexation constaté
+      // sur des mints tout juste créés, voir fetchHolderConcentration) et
+      // ne doit jamais retarder ce pour quoi cet outil existe : vous
+      // montrer le token pendant que vous pouvez encore réagir.
+      if (!NO_OPEN) openInBrowser(url);
 
       const holders = await fetchHolderSummary(msg.mint, bondingCurvePda);
       if (holders.error) {
-        console.log(`  détenteurs : lecture échouée (${holders.error})`);
+        console.log(`  [candidat ${candidateNum}] détenteurs : lecture échouée (${holders.error})`);
       } else {
         console.log(
-          `  détenteurs : ${holders.top_holders_count} wallet(s) hors curve détiennent ${fmt(holders.top_holders_pct_of_supply, 1)}% de l'offre totale`
+          `  [candidat ${candidateNum}] détenteurs : ${holders.top_holders_count} wallet(s) hors curve détiennent ${fmt(holders.top_holders_pct_of_supply, 1)}% de l'offre totale`
         );
       }
-      console.log(`  -> ${url}${NO_OPEN ? '  (AXIOM_NO_OPEN=1 : pas ouvert)' : ''}\n`);
-      if (!NO_OPEN) openInBrowser(url);
 
-      // L'ouverture est immédiate ; l'écriture JSONL attend la fin du
-      // suivi post-match (voir en-tête du fichier) pour inclure la
-      // trajectoire complète et un verdict.
-      if (reason === 'complete') {
-        appendMatchRecord({
-          matched_at: new Date().toISOString(),
-          mint: msg.mint,
-          symbol: msg.symbol || null,
-          name: msg.name || null,
-          creator: msg.traderPublicKey ?? msg.creator ?? null,
-          axiom_url: url,
-          reason,
-          movement_sol: movedSol,
-          creation: {
-            market_cap_sol: marketCap,
-            creator_buy_sol: creatorBuy,
-            virtual_sol_reserves: baselineVSol,
-            virtual_token_reserves: Number(msg.vTokensInBondingCurve) || null,
-            is_mayhem_mode: mayhem,
-            metadata_uri: msg.uri || null,
-          },
-          at_match: { virtual_sol_reserves: state.virtual_quote_reserves_sol, virtual_token_reserves: state.virtual_token_reserves, complete: true },
-          holders_at_match: holders,
-          post_match_track: [],
-          verdict: 'migré au moment du match',
-          raw_new_token_event: msg,
-        });
-        return;
-      }
+      // Base commune aux deux lignes (match immédiat + post_match différé,
+      // voir en-tête du fichier) — matched_at fixé une seule fois pour que
+      // les deux lignes se recorrèlent sur (mint, matched_at).
+      const matchedAt = new Date().toISOString();
+      const baseRecord = {
+        matched_at: matchedAt,
+        mint: msg.mint,
+        symbol: msg.symbol || null,
+        name: msg.name || null,
+        creator: msg.traderPublicKey ?? msg.creator ?? null,
+        axiom_url: url,
+        reason,
+        movement_sol: movedSol,
+        creation: {
+          market_cap_sol: marketCap,
+          creator_buy_sol: creatorBuy,
+          virtual_sol_reserves: baselineVSol,
+          virtual_token_reserves: Number(msg.vTokensInBondingCurve) || null,
+          is_mayhem_mode: mayhem,
+          metadata_uri: msg.uri || null,
+        },
+        at_match: { virtual_sol_reserves: state.virtual_quote_reserves_sol, virtual_token_reserves: state.virtual_token_reserves, complete: state.complete },
+        holders_at_match: holders,
+        raw_new_token_event: msg,
+      };
+
+      // Écrite tout de suite, à l'ouverture — jamais d'attente.
+      appendMatchRecord({
+        ...baseRecord,
+        stage: 'match',
+        post_match_track: [],
+        verdict: reason === 'complete' ? 'migré au moment du match' : 'suivi post-match en cours',
+      });
+
+      if (reason === 'complete') return;
 
       console.log(`  [candidat ${candidateNum}] suivi post-match en cours (${POST_MATCH_DURATION_MS / 1000}s, ${POST_MATCH_POLL_INTERVAL_MS / 1000}s/point)...`);
       trackPostMatch(msg.mint, state.virtual_quote_reserves_sol).then(({ track, peakVSol, migratedDuringTracking }) => {
@@ -348,31 +410,10 @@ function main() {
         console.log(`  [candidat ${candidateNum}] suivi terminé — verdict : ${verdict} (finalVSol=${fmt(finalVSol)}, peak=${fmt(peakVSol)})\n`);
 
         appendMatchRecord({
-          matched_at: new Date().toISOString(),
-          mint: msg.mint,
-          symbol: msg.symbol || null,
-          name: msg.name || null,
-          creator: msg.traderPublicKey ?? msg.creator ?? null,
-          axiom_url: url,
-          reason,
-          movement_sol: movedSol,
-          creation: {
-            market_cap_sol: marketCap,
-            creator_buy_sol: creatorBuy,
-            virtual_sol_reserves: baselineVSol,
-            virtual_token_reserves: Number(msg.vTokensInBondingCurve) || null,
-            is_mayhem_mode: mayhem,
-            metadata_uri: msg.uri || null,
-          },
-          at_match: {
-            virtual_sol_reserves: state.virtual_quote_reserves_sol,
-            virtual_token_reserves: state.virtual_token_reserves,
-            complete: state.complete,
-          },
-          holders_at_match: holders,
+          ...baseRecord,
+          stage: 'post_match',
           post_match_track: track,
           verdict,
-          raw_new_token_event: msg,
         });
       });
     });

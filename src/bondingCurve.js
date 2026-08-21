@@ -99,16 +99,37 @@ function decodeBondingCurve(base64Data) {
   };
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Retry sur 429 ajouté le 2026-08-21 : holders.js peut émettre ~20 appels
+// getAccountInfo en rafale au moment d'un match (résolution des top
+// holders), sur le RPC public gratuit déjà sollicité par le sondage de
+// mouvement/suivi post-match du même script — un seul 429 faisait échouer
+// tout holders_at_match d'un coup, sans aucune tentative de rattrapage.
+// Backoff exponentiel court (500ms, 1s, 2s) : assez pour laisser retomber
+// une rafale locale, pas assez pour bloquer longtemps le sondage principal
+// qui attend ce résultat.
+const RPC_MAX_RETRIES = 3;
+const RPC_RETRY_BASE_MS = 500;
+
 async function rpcCall(rpcUrl, method, params) {
-  const res = await fetch(rpcUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = await res.json();
-  if (json.error) throw new Error(`RPC ${method}: ${JSON.stringify(json.error)}`);
-  return json.result;
+  for (let attempt = 0; ; attempt += 1) {
+    const res = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    });
+    if (res.status === 429 && attempt < RPC_MAX_RETRIES) {
+      await sleep(RPC_RETRY_BASE_MS * 2 ** attempt);
+      continue;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    if (json.error) throw new Error(`RPC ${method}: ${JSON.stringify(json.error)}`);
+    return json.result;
+  }
 }
 
 // Lit et décode l'état ACTUEL (pas l'historique) de la bonding curve d'un

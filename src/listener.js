@@ -36,7 +36,8 @@
 
 const WebSocket = require('ws');
 const { createClient } = require('@supabase/supabase-js');
-const { fetchBondingCurveState } = require('./bondingCurve');
+const { fetchBondingCurveState, deriveBondingCurvePda } = require('./bondingCurve');
+const { fetchHolderConcentration } = require('./holders');
 
 // Constantes surchargeables par variable d'environnement — pratique pour
 // les tests d'intégration locaux (voir test/) sans attendre 6h.
@@ -62,6 +63,16 @@ const BONDING_CURVE_SNAPSHOT_DELAYS_MS = (process.env.BONDING_CURVE_SNAPSHOT_DEL
 // confondus — protège le RPC public gratuit d'un afflux de créations
 // groupées plutôt que de compter sur le hasard de l'espacement naturel.
 const BONDING_CURVE_RPC_MIN_INTERVAL_MS = Number(process.env.BONDING_CURVE_RPC_MIN_INTERVAL_MS) || 300;
+
+// Concentration des détenteurs (2026-08-21, voir sql/schema.sql) : capturée
+// UNE SEULE FOIS par token, sur le snapshot dont le délai correspond à
+// cette valeur — pas à chaque snapshot, ~20 appels RPC par lecture (voir
+// src/holders.js) sur un listener qui suit TOUS les tokens créés (pas le
+// sous-ensemble filtré de scripts/watch-axiom-candidates.js), donc un
+// point dans le temps plutôt qu'une trajectoire complète pour rester
+// raisonnable envers le quota RPC. Doit correspondre à une valeur présente
+// dans BONDING_CURVE_SNAPSHOT_DELAYS_MS, sinon elle n'est jamais capturée.
+const HOLDERS_SNAPSHOT_DELAY_MS = Number(process.env.HOLDERS_SNAPSHOT_DELAY_MS) || 30000;
 
 // --------------------------------------------------------------------
 // Classification / extraction — pures, testables sans réseau ni Supabase.
@@ -213,17 +224,40 @@ function createRpcThrottle(minIntervalMs) {
   };
 }
 
-async function captureBondingCurveSnapshot(db, rpcThrottle, mint, createdAtMs, fetchFn = fetchBondingCurveState) {
+// holdersFetchFn injectable séparément de fetchFn (test/integration.js n'a
+// pas besoin de fausser les deux de la même façon — la bonding curve et les
+// holders touchent des méthodes RPC différentes).
+async function captureBondingCurveSnapshot(
+  db,
+  rpcThrottle,
+  mint,
+  createdAtMs,
+  { captureHolders = false, fetchFn = fetchBondingCurveState, holdersFetchFn = fetchHolderConcentration } = {}
+) {
   const ageSeconds = Math.round((Date.now() - createdAtMs) / 1000);
   try {
     const state = await rpcThrottle(() => fetchFn(SOLANA_RPC_URL, mint));
-    await db.insertSnapshot({
+    const row = {
       mint,
       age_seconds: ageSeconds,
       virtual_sol_reserves: state.virtual_quote_reserves_sol,
       virtual_token_reserves: state.virtual_token_reserves,
       raw_event: state,
-    });
+    };
+    if (captureHolders) {
+      try {
+        const { pda } = deriveBondingCurvePda(mint);
+        const holders = await rpcThrottle(() => holdersFetchFn(SOLANA_RPC_URL, mint, pda));
+        row.total_supply = holders.total_supply;
+        row.curve_held_amount = holders.curve_held_amount;
+        row.top_holders_count = holders.top_holders_count;
+        row.top_holders_pct_of_supply = holders.top_holders_pct_of_supply;
+        row.holders_raw = holders;
+      } catch (err) {
+        row.holders_error = err.message;
+      }
+    }
+    await db.insertSnapshot(row);
   } catch (err) {
     await db.logIngestion('bonding_curve_snapshot_error', `${mint} @${ageSeconds}s: ${err.message}`).catch(() => {});
   }
@@ -234,12 +268,20 @@ async function captureBondingCurveSnapshot(db, rpcThrottle, mint, createdAtMs, f
 // timer se déclenche, pas au moment où il est programmé — un run peut
 // commencer son arrêt entre les deux (voir main()). On laisse alors ce
 // snapshot de côté plutôt que de risquer une écriture pendant le relais.
-function scheduleBondingCurveSnapshots(db, rpcThrottle, mint, createdAtMs, isShuttingDown, delaysMs = BONDING_CURVE_SNAPSHOT_DELAYS_MS) {
+function scheduleBondingCurveSnapshots(
+  db,
+  rpcThrottle,
+  mint,
+  createdAtMs,
+  isShuttingDown,
+  delaysMs = BONDING_CURVE_SNAPSHOT_DELAYS_MS,
+  holdersDelayMs = HOLDERS_SNAPSHOT_DELAY_MS
+) {
   return delaysMs.map((delayMs) => {
     const remaining = Math.max(delayMs - (Date.now() - createdAtMs), 0);
     return setTimeout(() => {
       if (isShuttingDown()) return;
-      captureBondingCurveSnapshot(db, rpcThrottle, mint, createdAtMs).catch(() => {});
+      captureBondingCurveSnapshot(db, rpcThrottle, mint, createdAtMs, { captureHolders: delayMs === holdersDelayMs }).catch(() => {});
     }, remaining);
   });
 }

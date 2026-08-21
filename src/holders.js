@@ -22,12 +22,33 @@ const { rpcCall } = require('./bondingCurve');
 const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
 
-function deriveAta(owner, mint) {
+// Découvert le 2026-08-21 en testant sur Helius : certains mints pump.fun
+// utilisent Token-2022 (extension metadataPointer visible dans
+// getAccountInfo), pas le programme SPL Token classique. Dériver l'ATA de
+// la bonding curve avec le mauvais programme donne une adresse qui ne
+// correspondra jamais au vrai compte de la curve — il faut lire le
+// programme propriétaire RÉEL du mint (fetchMintTokenProgram ci-dessous)
+// plutôt que de le supposer fixe.
+
+function deriveAta(owner, mint, tokenProgramId) {
   const [ata] = PublicKey.findProgramAddressSync(
-    [owner.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
+    [owner.toBuffer(), tokenProgramId.toBuffer(), mint.toBuffer()],
     ASSOCIATED_TOKEN_PROGRAM_ID
   );
   return ata;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Lit le programme propriétaire réel du mint (Token classique vs
+// Token-2022) — nécessaire pour dériver correctement l'ATA de la curve.
+async function fetchMintTokenProgram(rpcUrl, mint) {
+  const info = await rpcCall(rpcUrl, 'getAccountInfo', [mint, { encoding: 'jsonParsed', commitment: 'confirmed' }]);
+  const owner = info?.value?.owner;
+  if (!owner) throw new Error(`mint introuvable : ${mint}`);
+  return new PublicKey(owner);
 }
 
 // bondingCurvePda : la PDA déjà dérivée par deriveBondingCurvePda() côté
@@ -35,12 +56,34 @@ function deriveAta(owner, mint) {
 // sous la main).
 async function fetchHolderConcentration(rpcUrl, mint, bondingCurvePda) {
   const mintPubkey = new PublicKey(mint);
-  const curveAta = deriveAta(bondingCurvePda, mintPubkey).toBase58();
+  const tokenProgramId = await fetchMintTokenProgram(rpcUrl, mint);
+  const curveAta = deriveAta(bondingCurvePda, mintPubkey, tokenProgramId).toBase58();
 
-  const [largest, supplyInfo] = await Promise.all([
-    rpcCall(rpcUrl, 'getTokenLargestAccounts', [mint, { commitment: 'confirmed' }]),
-    rpcCall(rpcUrl, 'getTokenSupply', [mint, { commitment: 'confirmed' }]),
-  ]);
+  // Retry avec backoff sur ces deux appels seulement : constaté le
+  // 2026-08-21 qu'un mint tout juste créé (appelé au moment du match, donc
+  // parfois quelques secondes seulement après la création) peut renvoyer
+  // "Invalid param: not a Token mint" sur getTokenLargestAccounts — même
+  // quand getAccountInfo voit déjà le mint (voir fetchMintTokenProgram
+  // ci-dessus, appelé juste avant sans erreur). L'indexeur spécifique à
+  // getTokenLargestAccounts semble accuser plus de retard que la lecture
+  // de compte brute ; un premier essai à 500ms n'a pas suffi en test réel,
+  // d'où un backoff plus généreux (jusqu'à ~15s cumulés). Sans risque pour
+  // la réactivité de l'outil : l'ouverture du navigateur ne dépend plus de
+  // ce résultat (voir watch-axiom-candidates.js).
+  let largest, supplyInfo;
+  const delaysMs = [500, 1000, 2000, 4000, 8000];
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      [largest, supplyInfo] = await Promise.all([
+        rpcCall(rpcUrl, 'getTokenLargestAccounts', [mint, { commitment: 'confirmed' }]),
+        rpcCall(rpcUrl, 'getTokenSupply', [mint, { commitment: 'confirmed' }]),
+      ]);
+      break;
+    } catch (err) {
+      if (attempt >= delaysMs.length) throw err;
+      await sleep(delaysMs[attempt]);
+    }
+  }
 
   const totalSupply = Number(supplyInfo.value.amount);
   const accounts = largest.value || [];
