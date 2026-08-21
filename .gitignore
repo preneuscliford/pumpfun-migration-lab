@@ -1,3 +1,6 @@
 node_modules/
 .env
 *.log
+# Observations locales du script d'attention Axiom — pas des données du
+# projet, pas à publier sur le repo public (voir scripts/watch-axiom-candidates.js).
+data/

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 
-// Observation locale, ÉPHÉMÈRE : pas de Supabase, pas d'écriture nulle
-// part, rien n'est stocké. Se connecte au flux public PumpPortal
+// Observation locale : pas de Supabase, pas de collecte en continu comme
+// le listener de production. Se connecte au flux public PumpPortal
 // (subscribeNewToken uniquement — pas d'abonnement migration, on
 // n'observe que la création), filtre les nouveaux tokens dont les
 // features à la création tombent dans la plage P40-P60 du PROFIL DE
@@ -51,12 +51,34 @@
 // détecté par sondage périodique — voir waitForMovement(). Sinon,
 // abandon silencieux après MOVEMENT_MAX_WAIT_MS.
 //
+// Stockage local ajouté sur demande (2026-08-21) : chaque token
+// effectivement ouvert dans le navigateur (donc uniquement les MATCH,
+// pas les candidats abandonnés) est ajouté à data/axiom-matches.jsonl —
+// une ligne JSON par match, avec ses données au moment de l'ouverture
+// (features WS de création + état on-chain qui a déclenché le match).
+// Format JSONL (pas un tableau JSON classique) : chaque ligne s'ajoute
+// indépendamment (fs.appendFileSync), donc un Ctrl+C ou un crash en
+// cours de route ne corrompt jamais les lignes déjà écrites — un
+// tableau JSON unique aurait exigé de relire/réécrire tout le fichier à
+// chaque match. data/ est dans .gitignore : ce sont vos observations
+// locales, pas des données du projet à publier sur le repo public.
+//
 // Usage : node scripts/watch-axiom-candidates.js
 // (Ctrl+C pour arrêter — tourne indéfiniment tant que vous le laissez.)
 
+const fs = require('fs');
+const path = require('path');
 const WebSocket = require('ws');
 const { exec } = require('child_process');
 const { fetchBondingCurveState } = require('../src/bondingCurve');
+
+const DATA_DIR = path.join(__dirname, '..', 'data');
+const DATA_FILE = path.join(DATA_DIR, 'axiom-matches.jsonl');
+
+function appendMatchRecord(record) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.appendFileSync(DATA_FILE, JSON.stringify(record) + '\n');
+}
 
 const PUMPPORTAL_WS_URL = process.env.PUMPPORTAL_WS_URL || 'wss://pumpportal.fun/api/data';
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
@@ -147,8 +169,8 @@ function main() {
   ws.on('open', () => {
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
     console.log(`[${new Date().toISOString()}] connecté à PumpPortal (subscribeNewToken uniquement).`);
-    console.log(`Filtre actif : market_cap ∈ [${MARKET_CAP_SOL_RANGE.join(', ')}] SOL, achat_créateur ∈ [${CREATOR_BUY_SOL_RANGE.join(', ')}] SOL`);
-    console.log('Rien n\'est stocké — observation locale uniquement. Ctrl+C pour arrêter.\n');
+    console.log(`Filtre actif : market_cap ∈ [${MARKET_CAP_SOL_RANGE.join(', ')}] SOL, achat_créateur ∈ [${CREATOR_BUY_SOL_RANGE.join(', ')}] SOL, mouvement ≥ ${MOVEMENT_THRESHOLD_SOL} SOL`);
+    console.log(`Chaque match ouvert est ajouté à ${path.relative(process.cwd(), DATA_FILE)} (local, pas sur Supabase). Ctrl+C pour arrêter.\n`);
   });
 
   ws.on('message', (data) => {
@@ -185,11 +207,38 @@ function main() {
       }
       matched += 1;
       const url = `https://axiom.trade/t/${msg.mint}`;
-      const why = reason === 'complete' ? 'MIGRÉ pendant la surveillance' : `bougé de ${fmt(Math.abs(state.virtual_quote_reserves_sol - baselineVSol))} SOL`;
+      const movedSol = Math.abs(state.virtual_quote_reserves_sol - baselineVSol);
+      const why = reason === 'complete' ? 'MIGRÉ pendant la surveillance' : `bougé de ${fmt(movedSol)} SOL`;
       console.log(`[MATCH ${matched}] ${msg.symbol || '(sans symbole)'} — ${msg.mint} — ${why}`);
       console.log(`  à la création (WS) : market_cap=${marketCap} SOL  achat_créateur=${creatorBuy} SOL  vSol=${fmt(baselineVSol)}  is_mayhem_mode=${mayhem === null ? 'n/a' : mayhem}`);
       console.log(`  on-chain (RPC, maintenant) : vSol=${state.virtual_quote_reserves_sol}  vToken=${state.virtual_token_reserves}  complete=${state.complete}`);
       console.log(`  -> ${url}${NO_OPEN ? '  (AXIOM_NO_OPEN=1 : pas ouvert)' : ''}\n`);
+
+      appendMatchRecord({
+        matched_at: new Date().toISOString(),
+        mint: msg.mint,
+        symbol: msg.symbol || null,
+        name: msg.name || null,
+        creator: msg.traderPublicKey ?? msg.creator ?? null,
+        axiom_url: url,
+        reason, // 'moved' | 'complete'
+        movement_sol: movedSol,
+        creation: {
+          market_cap_sol: marketCap,
+          creator_buy_sol: creatorBuy,
+          virtual_sol_reserves: baselineVSol,
+          virtual_token_reserves: Number(msg.vTokensInBondingCurve) || null,
+          is_mayhem_mode: mayhem,
+          metadata_uri: msg.uri || null,
+        },
+        at_match: {
+          virtual_sol_reserves: state.virtual_quote_reserves_sol,
+          virtual_token_reserves: state.virtual_token_reserves,
+          complete: state.complete,
+        },
+        raw_new_token_event: msg,
+      });
+
       if (!NO_OPEN) openInBrowser(url);
     });
   });
