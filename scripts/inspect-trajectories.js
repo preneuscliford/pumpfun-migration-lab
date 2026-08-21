@@ -70,7 +70,9 @@ async function main() {
   // intéresse.
   const { data: migratedB, error: migError } = await supabase
     .from('tokens')
-    .select('mint, symbol, migrated_at, time_to_migration_seconds')
+    .select(
+      'mint, symbol, migrated_at, time_to_migration_seconds, created_at, creator, initial_market_cap_sol, initial_virtual_sol_reserves, initial_virtual_token_reserves, metadata_uri, raw_new_token_event'
+    )
     .eq('migrated', true)
     .gt('time_to_migration_seconds', 10)
     .order('time_to_migration_seconds', { ascending: true })
@@ -100,6 +102,13 @@ async function main() {
     for (const t of migratedB) {
       const points = bByMint.get(t.mint) || [];
       console.log(`\n${t.mint} — ${t.symbol || '(sans symbole)'} — migré en ${t.time_to_migration_seconds}s (${points.length} snapshot(s))`);
+      const raw = t.raw_new_token_event || {};
+      console.log(
+        `  à la création : créé=${t.created_at}  creator=${t.creator}  market_cap=${t.initial_market_cap_sol}  vSol=${t.initial_virtual_sol_reserves}  vToken=${t.initial_virtual_token_reserves}`
+      );
+      console.log(
+        `                 solAmount(achat créateur)=${raw.solAmount ?? 'n/a'}  initialBuy=${raw.initialBuy ?? 'n/a'}  is_mayhem_mode=${raw.is_mayhem_mode ?? 'n/a'}  uri=${t.metadata_uri ? 'oui' : 'non'}`
+      );
       for (const p of points) {
         console.log(`  age=${String(p.age_seconds).padStart(4)}s  vSol=${p.virtual_sol_reserves}  vToken=${p.virtual_token_reserves}`);
       }
