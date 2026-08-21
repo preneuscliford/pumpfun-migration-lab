@@ -114,9 +114,17 @@ async function rpcCall(rpcUrl, method, params) {
 // Lit et décode l'état ACTUEL (pas l'historique) de la bonding curve d'un
 // mint. Lève une erreur si le compte est introuvable ou si le décodage
 // échoue — à l'appelant de décider quoi en faire.
+//
+// commitment='confirmed' explicitement (pas le défaut implicite du nœud,
+// souvent 'finalized') : repéré en testant sur des tokens tout juste
+// créés (scripts/watch-axiom-candidates.js) que 'finalized' peut retarder
+// la visibilité du compte de plusieurs secondes après l'événement
+// PumpPortal, alors que 'confirmed' le voit presque immédiatement. Sans
+// incidence sur les scripts qui lisent des tokens déjà vieux de plusieurs
+// minutes/heures (n'importe quel commitment les voit).
 async function fetchBondingCurveState(rpcUrl, mint) {
   const { pda } = deriveBondingCurvePda(mint);
-  const accountInfo = await rpcCall(rpcUrl, 'getAccountInfo', [pda.toBase58(), { encoding: 'base64' }]);
+  const accountInfo = await rpcCall(rpcUrl, 'getAccountInfo', [pda.toBase58(), { encoding: 'base64', commitment: 'confirmed' }]);
   if (!accountInfo || !accountInfo.value) {
     throw new Error(`compte bonding curve introuvable pour ${mint} (pda ${pda.toBase58()})`);
   }
