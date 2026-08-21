@@ -69,19 +69,20 @@ function printHistogram(values, bins) {
   }
 }
 
-// Trois groupes de résultat, pas cinq tranches fines : on soupçonne que
-// mélanger les migrations quasi-instantanées (probablement mécaniques —
-// achat initial du créateur qui franchit le seuil de la bonding curve à
-// lui seul) avec les migrations progressives (le token doit réellement
-// accumuler quelque chose) masque ce qui distingue VRAIMENT ces
-// dernières des non-migrés. D'où : A (immédiate), B (progressive), C
-// (non-migré) — la vraie question de recherche est B vs C, A sert
-// surtout de groupe à part pour ne plus le laisser polluer B vs C.
-// Seuil des 10s fourni explicitement, pas dérivé de la distribution.
+// Trois groupes de résultat. A (immédiate) est explicitement EXCLU de la
+// population cible : trop proche d'un événement mécanique (l'achat
+// initial du créateur qui franchit seul le seuil de la bonding curve), et
+// ça ne correspond de toute façon pas à la philosophie du projet — on veut
+// le temps d'observer un token, pas courir après un événement déjà
+// terminé à la création. Gardé dans le rapport uniquement pour
+// surveillance (vérifier que le motif reste stable), jamais comme
+// candidat à un signal exploitable. La vraie comparaison de recherche est
+// B (progressive) vs C (non-migré, témoin). Seuil des 10s fourni
+// explicitement, pas dérivé de la distribution.
 const OUTCOME_GROUPS = [
-  { label: 'A. immédiate (≤10s)', filter: (t) => t.migrated && t.time_to_migration_seconds !== null && t.time_to_migration_seconds !== undefined && t.time_to_migration_seconds <= 10 },
-  { label: 'B. progressive (>10s)', filter: (t) => t.migrated && t.time_to_migration_seconds !== null && t.time_to_migration_seconds !== undefined && t.time_to_migration_seconds > 10 },
-  { label: 'C. non-migré', filter: (t) => !t.migrated },
+  { label: 'A. immédiate ≤10s [HORS CIBLE, surveillance uniquement]', filter: (t) => t.migrated && t.time_to_migration_seconds !== null && t.time_to_migration_seconds !== undefined && t.time_to_migration_seconds <= 10 },
+  { label: 'B. progressive >10s [POPULATION CIBLE]', filter: (t) => t.migrated && t.time_to_migration_seconds !== null && t.time_to_migration_seconds !== undefined && t.time_to_migration_seconds > 10 },
+  { label: 'C. non-migré [témoin]', filter: (t) => !t.migrated },
 ];
 
 function groupTokens(tokens) {
@@ -162,12 +163,16 @@ async function main() {
   const nonMigrated = tokens.filter((t) => !t.migrated);
   const observationClosed = nonMigrated.filter((t) => t.observation_closed_at);
   const stillOpen = nonMigrated.filter((t) => !t.observation_closed_at);
+  const groups = groupTokens(tokens);
+  const immediateCount = groups[0].tokens.length; // A — hors population cible
+  const targetCount = groups[1].tokens.length; // B — progressive, population cible
 
   console.log('='.repeat(72));
   console.log(`Rapport pumpfun-migration-lab — ${new Date().toISOString()}`);
   console.log('='.repeat(72));
   console.log(`Tokens avec création observée : ${total} (${creationMissedCount} exclu(s) — création jamais vue, pas d'âge/features fiables)`);
-  console.log(`  migrés            : ${migrated.length}${total ? ` (${((migrated.length / total) * 100).toFixed(2)}%)` : ''}`);
+  console.log(`  migrés (brut)     : ${migrated.length}${total ? ` (${((migrated.length / total) * 100).toFixed(2)}%)` : ''} — dont ${immediateCount} immédiate(s) [hors cible] + ${targetCount} progressive(s) [cible]`);
+  console.log(`  migrés CIBLE      : ${targetCount}${total ? ` (${((targetCount / total) * 100).toFixed(2)}%)` : ''} — taux de migration hors migrations mécaniques (≤10s exclues)`);
   console.log(`  non migrés        : ${nonMigrated.length} (dont ${stillOpen.length} encore dans leur fenêtre de 6h, ${observationClosed.length} fenêtre fermée)`);
 
   const ttms = migrated.map((t) => t.time_to_migration_seconds).filter((v) => v !== null && v !== undefined);
@@ -204,10 +209,8 @@ async function main() {
   // n'importe quel seuil "trouvé" serait de l'overfitting pur. On vise au
   // moins quelques centaines de migrations avant d'envisager ce split.
 
-  console.log('\nDistribution des features à la création, par groupe de résultat (A immédiate / B progressive / C non-migré) :');
+  console.log('\nDistribution des features à la création, par groupe de résultat (A hors cible / B cible / C témoin) :');
   console.log('  (échantillon encore petit, surtout pour A et B — repère, pas une conclusion statistique)');
-
-  const groups = groupTokens(tokens);
 
   printFeatureDistribution(
     'initial_market_cap_sol',
