@@ -1,10 +1,21 @@
 #!/usr/bin/env node
 'use strict';
 
-// Écouteur PumpPortal — V1 : subscribeNewToken + subscribeMigration
-// uniquement (pas de subscribeTokenTrade, pas de polling). Aucun trading,
-// aucune clé de wallet : ce script ne fait que lire un flux public et
-// écrire dans Supabase.
+// Écouteur PumpPortal — subscribeNewToken + subscribeMigration uniquement
+// (toujours pas de subscribeTokenTrade). Aucun trading, aucune clé de
+// wallet : ce script lit un flux public, plus quelques appels RPC Solana
+// publics en lecture seule, et écrit dans Supabase.
+//
+// Expérience "trajectoire de la bonding curve" (2026-08-21) : pour chaque
+// token créé, on programme 4 lectures ponctuelles de sa bonding curve via
+// RPC Solana public (getAccountInfo, voir src/bondingCurve.js) à délais
+// fixes après la création — pas de polling continu, pas de
+// subscribeTokenTrade, pas de reconstruction via l'historique de
+// transactions. Objectif unique : voir si la progression vQuote/vToken à
+// 1/3/5min distingue les migrations progressives (groupe B, >10s) des
+// tokens qui ne migreront jamais (groupe C, témoin). Le calcul de la
+// progression elle-même se fait dans report.js, pas ici — le listener ne
+// fait qu'enregistrer les points de mesure bruts dans token_snapshots.
 //
 // Contrainte GitHub Actions : un job est tué au bout de 6h. Ce script ne
 // tente donc pas de tourner en continu indéfiniment — il s'arrête
@@ -25,6 +36,7 @@
 
 const WebSocket = require('ws');
 const { createClient } = require('@supabase/supabase-js');
+const { fetchBondingCurveState } = require('./bondingCurve');
 
 // Constantes surchargeables par variable d'environnement — pratique pour
 // les tests d'intégration locaux (voir test/) sans attendre 6h.
@@ -37,6 +49,19 @@ const RECONNECT_BASE_MS = Number(process.env.RECONNECT_BASE_MS) || 1000;
 const RECONNECT_MAX_MS = Number(process.env.RECONNECT_MAX_MS) || 30_000;
 const OBSERVATION_WINDOW_MS = Number(process.env.OBSERVATION_WINDOW_MS) || 6 * 3600 * 1000;
 const RELAY_CHECK_INTERVAL_MS = Number(process.env.RELAY_CHECK_INTERVAL_MS) || 30_000;
+
+// Délais après création auxquels on lit la bonding curve (30s/1min/3min/
+// 5min par défaut — voir en-tête du fichier). Liste de millisecondes
+// séparées par des virgules.
+const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+const BONDING_CURVE_SNAPSHOT_DELAYS_MS = (process.env.BONDING_CURVE_SNAPSHOT_DELAYS_MS || '30000,60000,180000,300000')
+  .split(',')
+  .map(Number)
+  .filter((n) => Number.isFinite(n) && n > 0);
+// Espacement minimum entre deux appels RPC bonding-curve, tous tokens
+// confondus — protège le RPC public gratuit d'un afflux de créations
+// groupées plutôt que de compter sur le hasard de l'espacement naturel.
+const BONDING_CURVE_RPC_MIN_INTERVAL_MS = Number(process.env.BONDING_CURVE_RPC_MIN_INTERVAL_MS) || 300;
 
 // --------------------------------------------------------------------
 // Classification / extraction — pures, testables sans réseau ni Supabase.
@@ -113,6 +138,10 @@ function createDb(supabaseClient) {
       const { error } = await supabaseClient.from('ingestion_log').insert({ event_type: eventType, detail: detail ?? null });
       if (error) console.error(`logIngestion(${eventType}) a échoué: ${error.message}`);
     },
+    async insertSnapshot(row) {
+      const { error } = await supabaseClient.from('token_snapshots').insert(row);
+      if (error) throw new Error(`insertSnapshot: ${error.message}`);
+    },
     // Ferme la fenêtre d'observation des tokens non migrés créés il y a
     // plus de OBSERVATION_WINDOW_MS. Ne touche PAS aux lignes tokens
     // elles-mêmes (le résumé est gardé pour tous, migrés ou non — voir
@@ -166,6 +195,56 @@ class EventBuffer {
 }
 
 // --------------------------------------------------------------------
+// Snapshots de bonding curve — trajectoire à délais fixes après création
+// (voir en-tête du fichier). Pas de polling continu : une poignée de
+// lectures ponctuelles par token, sérialisées via une file d'attente pour
+// rester raisonnable envers le RPC public gratuit.
+// --------------------------------------------------------------------
+
+// File qui espace les appels RPC d'au moins minIntervalMs, tous appelants
+// confondus. Chaque appel attend son tour puis s'exécute ; le résultat
+// (succès ou échec) de fn() est celui renvoyé à l'appelant.
+function createRpcThrottle(minIntervalMs) {
+  let queue = Promise.resolve();
+  return function enqueue(fn) {
+    const result = queue.then(fn);
+    queue = result.catch(() => {}).then(() => new Promise((resolve) => setTimeout(resolve, minIntervalMs)));
+    return result;
+  };
+}
+
+async function captureBondingCurveSnapshot(db, rpcThrottle, mint, createdAtMs, fetchFn = fetchBondingCurveState) {
+  const ageSeconds = Math.round((Date.now() - createdAtMs) / 1000);
+  try {
+    const state = await rpcThrottle(() => fetchFn(SOLANA_RPC_URL, mint));
+    await db.insertSnapshot({
+      mint,
+      age_seconds: ageSeconds,
+      virtual_sol_reserves: state.virtual_quote_reserves_sol,
+      virtual_token_reserves: state.virtual_token_reserves,
+      raw_event: state,
+    });
+  } catch (err) {
+    await db.logIngestion('bonding_curve_snapshot_error', `${mint} @${ageSeconds}s: ${err.message}`).catch(() => {});
+  }
+}
+
+// Programme les lectures pour un token qui vient d'être créé. isShuttingDown
+// est une fonction (pas une valeur) car on veut lire l'état AU MOMENT où le
+// timer se déclenche, pas au moment où il est programmé — un run peut
+// commencer son arrêt entre les deux (voir main()). On laisse alors ce
+// snapshot de côté plutôt que de risquer une écriture pendant le relais.
+function scheduleBondingCurveSnapshots(db, rpcThrottle, mint, createdAtMs, isShuttingDown, delaysMs = BONDING_CURVE_SNAPSHOT_DELAYS_MS) {
+  return delaysMs.map((delayMs) => {
+    const remaining = Math.max(delayMs - (Date.now() - createdAtMs), 0);
+    return setTimeout(() => {
+      if (isShuttingDown()) return;
+      captureBondingCurveSnapshot(db, rpcThrottle, mint, createdAtMs).catch(() => {});
+    }, remaining);
+  });
+}
+
+// --------------------------------------------------------------------
 // Relais entre runs GitHub Actions (contournement de la limite de 6h par
 // job). Nécessite `permissions: actions: write` dans le workflow pour que
 // GITHUB_TOKEN puisse déclencher un nouveau run.
@@ -206,6 +285,7 @@ async function main() {
   const supabaseKey = requireEnv('SUPABASE_SERVICE_KEY');
   const db = createDb(createClient(supabaseUrl, supabaseKey, { auth: { persistSession: false } }));
   const buffer = new EventBuffer(db);
+  const rpcThrottle = createRpcThrottle(BONDING_CURVE_RPC_MIN_INTERVAL_MS);
 
   let ws = null;
   let lastMessageAt = Date.now();
@@ -236,7 +316,9 @@ async function main() {
       const nowIso = new Date().toISOString();
       const type = classifyEvent(msg);
       if (type === 'new_token') {
-        buffer.addNewToken(buildTokenRow(msg, nowIso));
+        const row = buildTokenRow(msg, nowIso);
+        buffer.addNewToken(row);
+        scheduleBondingCurveSnapshots(db, rpcThrottle, row.mint, Date.parse(row.created_at), () => shuttingDown);
       } else if (type === 'migration') {
         buffer.addMigration(buildMigrationRow(msg, nowIso));
       } else {
@@ -322,7 +404,18 @@ async function main() {
   process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
-module.exports = { classifyEvent, buildTokenRow, buildMigrationRow, createDb, EventBuffer, triggerNextRun, main };
+module.exports = {
+  classifyEvent,
+  buildTokenRow,
+  buildMigrationRow,
+  createDb,
+  EventBuffer,
+  triggerNextRun,
+  createRpcThrottle,
+  captureBondingCurveSnapshot,
+  scheduleBondingCurveSnapshots,
+  main,
+};
 
 if (require.main === module) {
   main().catch((err) => {

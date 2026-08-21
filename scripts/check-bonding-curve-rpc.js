@@ -43,11 +43,14 @@
 //
 // Usage : node scripts/check-bonding-curve-rpc.js
 
-const { PublicKey } = require('@solana/web3.js');
 const { createClient } = require('@supabase/supabase-js');
+const { deriveBondingCurvePda, decodeBondingCurve, rpcCall: sharedRpcCall } = require('../src/bondingCurve');
+
+// Layout et décodage désormais partagés avec src/bondingCurve.js (utilisé
+// aussi par le listener pour les snapshots programmés) — voir ce fichier
+// pour le détail du layout 151 octets.
 
 const RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
-const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 
 function requireEnv(name) {
   const v = process.env[name];
@@ -55,68 +58,7 @@ function requireEnv(name) {
   return v;
 }
 
-async function rpcCall(method, params) {
-  const res = await fetch(RPC_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = await res.json();
-  if (json.error) throw new Error(`RPC ${method}: ${JSON.stringify(json.error)}`);
-  return json.result;
-}
-
-// Décode le layout confirmé (151 octets, voir en-tête du fichier). Retourne
-// un objet {error} plutôt que de planter si la taille ne correspond pas —
-// c'est en soi un résultat de test (layout encore faux ou compte différent).
-const EXPECTED_LAYOUT_BYTES = 151;
-
-function decodeBondingCurve(base64Data) {
-  const buf = Buffer.from(base64Data, 'base64');
-  if (buf.length < EXPECTED_LAYOUT_BYTES) {
-    return { error: `taille inattendue: ${buf.length} octets (attendu ${EXPECTED_LAYOUT_BYTES})`, rawByteLength: buf.length };
-  }
-  let offset = 8; // discriminator Anchor
-  const readU64 = () => {
-    const v = buf.readBigUInt64LE(offset);
-    offset += 8;
-    return v;
-  };
-  const readPubkey = () => {
-    const v = new PublicKey(buf.subarray(offset, offset + 32)).toBase58();
-    offset += 32;
-    return v;
-  };
-  const virtualTokenReserves = readU64();
-  const virtualQuoteReserves = readU64();
-  const realTokenReserves = readU64();
-  const realQuoteReserves = readU64();
-  const tokenTotalSupply = readU64();
-  const complete = buf.readUInt8(offset) === 1;
-  offset += 1;
-  const creator = readPubkey();
-  const isMayhemMode = buf.readUInt8(offset) === 1;
-  offset += 1;
-  const isCashbackCoin = buf.readUInt8(offset) === 1;
-  offset += 1;
-  const quoteMint = readPubkey();
-  return {
-    virtual_token_reserves: virtualTokenReserves.toString(),
-    virtual_quote_reserves: virtualQuoteReserves.toString(),
-    virtual_quote_reserves_sol: Number(virtualQuoteReserves) / 1e9,
-    real_token_reserves: realTokenReserves.toString(),
-    real_quote_reserves: realQuoteReserves.toString(),
-    real_quote_reserves_sol: Number(realQuoteReserves) / 1e9,
-    token_total_supply: tokenTotalSupply.toString(),
-    complete,
-    creator,
-    is_mayhem_mode: isMayhemMode,
-    is_cashback_coin: isCashbackCoin,
-    quote_mint: quoteMint,
-    rawByteLength: buf.length,
-  };
-}
+const rpcCall = (method, params) => sharedRpcCall(RPC_URL, method, params);
 
 async function main() {
   const supabase = createClient(requireEnv('SUPABASE_URL'), requireEnv('SUPABASE_SERVICE_KEY'), {
@@ -153,11 +95,7 @@ async function main() {
   console.log(`  is_mayhem_mode connu (à la création, via raw_new_token_event) : ${rawIsMayhemMode === null ? 'n/a' : rawIsMayhemMode}`);
   console.log('='.repeat(72));
 
-  const mintPubkey = new PublicKey(token.mint);
-  const [bondingCurvePda, bump] = PublicKey.findProgramAddressSync(
-    [Buffer.from('bonding-curve'), mintPubkey.toBuffer()],
-    PUMP_FUN_PROGRAM_ID
-  );
+  const { pda: bondingCurvePda, bump } = deriveBondingCurvePda(token.mint);
   console.log(`\nPDA bonding curve dérivée (calcul local, pas d'appel réseau) : ${bondingCurvePda.toBase58()} (bump ${bump})`);
 
   console.log("\n--- Test 1/3 : getAccountInfo (état ACTUEL du compte, PAS l'historique) ---");

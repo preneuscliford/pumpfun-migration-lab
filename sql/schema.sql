@@ -1,16 +1,17 @@
--- Schéma V1 — laboratoire pump.fun.
+-- Schéma — laboratoire pump.fun.
 --
--- Décision V1 (voir README) : subscribeNewToken + subscribeMigration
--- uniquement, pas de subscribeTokenTrade ni de polling. Il n'y a donc PAS
--- de flux de snapshots intermédiaires en V1 — la table token_snapshots est
--- créée par avance pour l'option B (snapshots périodiques), mais reste
--- vide tant qu'on ne l'active pas. Ne pas s'étonner qu'elle soit vide au
--- début : c'est voulu, pas un bug de collecte.
+-- Toujours pas de subscribeTokenTrade ni de polling continu. Depuis le
+-- 2026-08-21, token_snapshots est alimentée par le listener via quelques
+-- lectures RPC Solana ponctuelles par token (getAccountInfo sur la
+-- bonding curve, à 30s/1min/3min/5min après la création — voir
+-- src/bondingCurve.js et src/listener.js) : pas un flux continu, juste 4
+-- points de mesure pour étudier la trajectoire vQuote/vToken en tout
+-- début de vie du token.
 --
 -- Principe central : on garde un résumé pour TOUS les tokens (migrés ou
 -- non) — c'est le groupe témoin nécessaire pour comparer les deux
--- populations. Seul le détail (token_snapshots, quand il existera) est
--- purgé pour les non-migrés après la fenêtre d'observation.
+-- populations. La purge du détail (token_snapshots) pour les non-migrés
+-- après la fenêtre d'observation reste un TODO, pas encore implémentée.
 
 create table if not exists tokens (
   mint text primary key,
@@ -68,7 +69,10 @@ create table if not exists tokens (
 create index if not exists idx_tokens_migrated_created on tokens (migrated, created_at);
 create index if not exists idx_tokens_observation_open on tokens (observation_closed_at) where observation_closed_at is null and migrated = false;
 
--- Prêt pour l'option B (snapshots périodiques) — vide en V1, voir plus haut.
+-- Trajectoire de la bonding curve à délais fixes après création (voir en-
+-- tête du fichier). market_cap_sol reste NULL : pas de lecture du supply
+-- côté RPC pour ces snapshots (décision volontaire, voir listener.js),
+-- donc pas de quoi le calculer proprement.
 create table if not exists token_snapshots (
   id bigint generated always as identity primary key,
   mint text not null references tokens(mint) on delete cascade,

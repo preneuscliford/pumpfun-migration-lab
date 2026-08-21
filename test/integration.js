@@ -15,6 +15,12 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const { spawn } = require('child_process');
 const path = require('path');
+const { Keypair } = require('@solana/web3.js');
+
+// Mint valide (format base58 correct) pour que la dérivation de PDA côté
+// listener ne plante pas — 'FakeMint111' ne suffirait pas, ce n'est pas un
+// pubkey valide.
+const fakeMint = Keypair.generate().publicKey.toBase58();
 
 const httpRequests = [];
 const httpServer = http.createServer((req, res) => {
@@ -24,6 +30,58 @@ const httpServer = http.createServer((req, res) => {
     httpRequests.push({ method: req.method, url: req.url, body });
     res.writeHead(201, { 'Content-Type': 'application/json', 'Content-Range': '0-0/1' });
     res.end('[]');
+  });
+});
+
+// Faux RPC Solana : répond à getAccountInfo avec un compte bonding-curve
+// synthétique de 151 octets (même layout que src/bondingCurve.js), pour
+// vérifier que le listener sait décoder une vraie réponse et écrire un
+// snapshot — pas juste qu'il tente l'appel.
+function buildFakeBondingCurveAccountBase64() {
+  const buf = Buffer.alloc(151);
+  let off = 8; // discriminator, contenu indifférent
+  buf.writeBigUInt64LE(1073000000000000n, off); off += 8; // virtual_token_reserves
+  buf.writeBigUInt64LE(30000000000n, off); off += 8; // virtual_quote_reserves (30 SOL)
+  buf.writeBigUInt64LE(793100000000000n, off); off += 8; // real_token_reserves
+  buf.writeBigUInt64LE(12000000000n, off); off += 8; // real_quote_reserves
+  buf.writeBigUInt64LE(1000000000000000n, off); off += 8; // token_total_supply
+  buf.writeUInt8(0, off); off += 1; // complete = false (encore en cours de bonding)
+  Keypair.generate().publicKey.toBuffer().copy(buf, off); off += 32; // creator
+  buf.writeUInt8(0, off); off += 1; // is_mayhem_mode
+  buf.writeUInt8(0, off); off += 1; // is_cashback_coin
+  Buffer.alloc(32).copy(buf, off); off += 32; // quote_mint = pubkey zéro (SOL natif)
+  return buf.toString('base64');
+}
+
+const rpcRequests = [];
+const rpcServer = http.createServer((req, res) => {
+  let body = '';
+  req.on('data', (chunk) => (body += chunk));
+  req.on('end', () => {
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      parsed = {};
+    }
+    rpcRequests.push(parsed);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    if (parsed.method === 'getAccountInfo') {
+      res.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          result: {
+            value: {
+              owner: '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+              data: [buildFakeBondingCurveAccountBase64(), 'base64'],
+            },
+          },
+        })
+      );
+    } else {
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: null }));
+    }
   });
 });
 
@@ -47,7 +105,7 @@ wss.on('connection', (socket) => {
     socket.send(
       JSON.stringify({
         txType: 'create',
-        mint: 'FakeMint111',
+        mint: fakeMint,
         name: 'Test Token',
         symbol: 'TEST',
         traderPublicKey: 'FakeDevWallet',
@@ -72,14 +130,16 @@ wss.on('connection', (socket) => {
   } else {
     // Sur la reconnexion, envoie un événement de migration.
     setTimeout(() => {
-      socket.send(JSON.stringify({ txType: 'migrate', mint: 'FakeMint111', pool: 'raydium' }));
+      socket.send(JSON.stringify({ txType: 'migrate', mint: fakeMint, pool: 'raydium' }));
     }, 200);
   }
 });
 
 async function main() {
   await new Promise((resolve) => httpServer.listen(0, resolve));
+  await new Promise((resolve) => rpcServer.listen(0, resolve));
   const httpPort = httpServer.address().port;
+  const rpcPort = rpcServer.address().port;
   const wsPort = wss.address().port;
 
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'src', 'listener.js')], {
@@ -88,6 +148,9 @@ async function main() {
       SUPABASE_URL: `http://127.0.0.1:${httpPort}`,
       SUPABASE_SERVICE_KEY: 'fake-key-for-test',
       PUMPPORTAL_WS_URL: `ws://127.0.0.1:${wsPort}`,
+      SOLANA_RPC_URL: `http://127.0.0.1:${rpcPort}`,
+      BONDING_CURVE_SNAPSHOT_DELAYS_MS: '50',
+      BONDING_CURVE_RPC_MIN_INTERVAL_MS: '10',
       MAX_RUNTIME_MS: '2500',
       RELAY_CHECK_INTERVAL_MS: '500',
       FLUSH_INTERVAL_MS: '400',
@@ -130,7 +193,7 @@ async function main() {
   const tokensCalls = httpRequests.filter((r) => r.url.includes('/tokens'));
   assert.ok(tokensCalls.length >= 2, `devrait avoir au moins 2 appels vers tokens (création + migration), obtenu ${tokensCalls.length}`);
   const createdRow = JSON.parse(tokensCalls[0].body);
-  assert.strictEqual(createdRow[0].mint, 'FakeMint111');
+  assert.strictEqual(createdRow[0].mint, fakeMint);
   assert.strictEqual(createdRow[0].symbol, 'TEST');
 
   const migrationCallBody = tokensCalls.find((c) => JSON.parse(c.body)[0].migrated === true);
@@ -144,10 +207,29 @@ async function main() {
   const relayLog = httpRequests.find((r) => r.url.includes('/ingestion_log') && r.body.includes('relay_handoff'));
   assert.ok(relayLog, 'la fin de run devrait logguer relay_handoff');
 
+  // Trajectoire de la bonding curve : le délai de snapshot est raccourci à
+  // 50ms (BONDING_CURVE_SNAPSHOT_DELAYS_MS), donc un seul snapshot est
+  // attendu, tiré peu après la création — vérifie que le listener a bien
+  // appelé le faux RPC (getAccountInfo) et écrit la ligne décodée.
+  assert.ok(
+    rpcRequests.some((r) => r.method === 'getAccountInfo'),
+    'le listener devrait avoir appelé getAccountInfo pour lire la bonding curve'
+  );
+  const snapshotCall = httpRequests.find((r) => r.url.includes('/token_snapshots'));
+  assert.ok(snapshotCall, 'devrait avoir écrit un snapshot dans token_snapshots');
+  // insertSnapshot() envoie un objet unique (comme logIngestion), pas un
+  // tableau (contrairement à upsertNewTokens/upsertMigrations) — pas de [0].
+  const snapshotRow = JSON.parse(snapshotCall.body);
+  assert.strictEqual(snapshotRow.mint, fakeMint);
+  assert.strictEqual(snapshotRow.virtual_sol_reserves, 30); // 30000000000 lamports / 1e9, voir buildFakeBondingCurveAccountBase64
+  assert.strictEqual(snapshotRow.virtual_token_reserves, '1073000000000000');
+  assert.ok(typeof snapshotRow.age_seconds === 'number' && snapshotRow.age_seconds >= 0, 'age_seconds devrait être un entier positif');
+
   console.log('\nTOUS LES TESTS D\'INTEGRATION OK');
-  console.log(`(${httpRequests.length} requêtes HTTP reçues, subscriptions=${subscriptions.join(',')}, reconnecté=${reconnected})`);
+  console.log(`(${httpRequests.length} requêtes HTTP reçues, ${rpcRequests.length} requêtes RPC reçues, subscriptions=${subscriptions.join(',')}, reconnecté=${reconnected})`);
 
   httpServer.close();
+  rpcServer.close();
   wss.close();
   process.exit(0);
 }
@@ -155,6 +237,7 @@ async function main() {
 main().catch((err) => {
   console.error('ECHEC:', err);
   httpServer.close();
+  rpcServer.close();
   wss.close();
   process.exit(1);
 });
