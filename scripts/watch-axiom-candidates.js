@@ -63,8 +63,23 @@
 // chaque match. data/ est dans .gitignore : ce sont vos observations
 // locales, pas des données du projet à publier sur le repo public.
 //
+// Suivi post-match ajouté sur retour terrain (2026-08-21, comparaison
+// PumpWall vs Wrixel) : "ces tokens ont des fausses pump, parfois le dev
+// sold et le token est mort, ou les top holders". Le mouvement détecté à
+// l'étage 2 ne dit rien de si ça TIENT — un faux pump qui se dégonfle
+// ressemble exactement à un vrai pump au moment du match. Donc après
+// avoir ouvert le navigateur, on continue de sonder la bonding curve
+// (toutes les POST_MATCH_POLL_INTERVAL_MS, pendant POST_MATCH_DURATION_MS)
+// et on n'écrit la ligne JSONL qu'une fois cette fenêtre terminée, avec
+// la trajectoire complète et un verdict descriptif (tenu / retombé /
+// repli partiel / migré) — verdict fourni pour vous faire gagner du
+// temps en le relisant, pas une décision automatique : c'est vous qui
+// jugez en le regardant sur Axiom.
+//
 // Usage : node scripts/watch-axiom-candidates.js
-// (Ctrl+C pour arrêter — tourne indéfiniment tant que vous le laissez.)
+// (Ctrl+C pour arrêter — tourne indéfiniment tant que vous le laissez.
+// Les matchs dont le suivi post-match n'est pas terminé au moment du
+// Ctrl+C ne seront pas écrits dans le JSONL.)
 
 const fs = require('fs');
 const path = require('path');
@@ -152,6 +167,51 @@ async function waitForMovement(mint, baselineVSol) {
   return { state: lastState, reason: 'timeout' };
 }
 
+// Fenêtre de suivi après un match (voir en-tête du fichier) : 3 minutes,
+// un point toutes les 20s (9 points) — assez pour voir un retournement
+// rapide sans faire traîner chaque candidat indéfiniment. Surchargeables
+// par variable d'environnement pour tester le cycle complet rapidement.
+const POST_MATCH_POLL_INTERVAL_MS = Number(process.env.POST_MATCH_POLL_INTERVAL_MS) || 20000;
+const POST_MATCH_DURATION_MS = Number(process.env.POST_MATCH_DURATION_MS) || 180000;
+
+async function trackPostMatch(mint, matchVSol) {
+  const track = [];
+  let peakVSol = matchVSol;
+  let migratedDuringTracking = false;
+  const start = Date.now();
+  while (Date.now() - start < POST_MATCH_DURATION_MS) {
+    await sleep(POST_MATCH_POLL_INTERVAL_MS);
+    const t_s = Math.round((Date.now() - start) / 1000);
+    try {
+      const state = await fetchBondingCurveState(SOLANA_RPC_URL, mint);
+      track.push({ t_s, virtual_sol_reserves: state.virtual_quote_reserves_sol, complete: state.complete });
+      if (state.complete) {
+        migratedDuringTracking = true;
+        break;
+      }
+      if (state.virtual_quote_reserves_sol > peakVSol) peakVSol = state.virtual_quote_reserves_sol;
+    } catch (err) {
+      track.push({ t_s, error: err.message });
+    }
+  }
+  return { track, peakVSol, migratedDuringTracking };
+}
+
+// Verdict DESCRIPTIF, pas une décision : sert à relire le fichier plus
+// vite, le jugement reste le vôtre en regardant Axiom. "retombé" exige
+// d'avoir rendu au moins 70% du gain observé au moment du match — un
+// seuil de lecture, pas un seuil validé statistiquement (trop tôt, un
+// seul cas comparé pour l'instant).
+function computeVerdict({ baselineVSol, matchVSol, peakVSol, finalVSol, migratedDuringTracking }) {
+  if (migratedDuringTracking) return 'migré pendant le suivi';
+  if (finalVSol === null || finalVSol === undefined) return 'suivi incomplet (erreurs RPC)';
+  const gainAtMatch = matchVSol - baselineVSol;
+  const retracedFromPeak = peakVSol - finalVSol;
+  if (gainAtMatch > 0 && retracedFromPeak >= gainAtMatch * 0.7) return 'retombé (probable faux pump)';
+  if (finalVSol >= peakVSol * 0.9) return 'tenu';
+  return 'repli partiel';
+}
+
 function openInBrowser(url) {
   const cmd =
     process.platform === 'win32' ? `start "" "${url}"` : process.platform === 'darwin' ? `open "${url}"` : `xdg-open "${url}"`;
@@ -213,33 +273,71 @@ function main() {
       console.log(`  à la création (WS) : market_cap=${marketCap} SOL  achat_créateur=${creatorBuy} SOL  vSol=${fmt(baselineVSol)}  is_mayhem_mode=${mayhem === null ? 'n/a' : mayhem}`);
       console.log(`  on-chain (RPC, maintenant) : vSol=${state.virtual_quote_reserves_sol}  vToken=${state.virtual_token_reserves}  complete=${state.complete}`);
       console.log(`  -> ${url}${NO_OPEN ? '  (AXIOM_NO_OPEN=1 : pas ouvert)' : ''}\n`);
-
-      appendMatchRecord({
-        matched_at: new Date().toISOString(),
-        mint: msg.mint,
-        symbol: msg.symbol || null,
-        name: msg.name || null,
-        creator: msg.traderPublicKey ?? msg.creator ?? null,
-        axiom_url: url,
-        reason, // 'moved' | 'complete'
-        movement_sol: movedSol,
-        creation: {
-          market_cap_sol: marketCap,
-          creator_buy_sol: creatorBuy,
-          virtual_sol_reserves: baselineVSol,
-          virtual_token_reserves: Number(msg.vTokensInBondingCurve) || null,
-          is_mayhem_mode: mayhem,
-          metadata_uri: msg.uri || null,
-        },
-        at_match: {
-          virtual_sol_reserves: state.virtual_quote_reserves_sol,
-          virtual_token_reserves: state.virtual_token_reserves,
-          complete: state.complete,
-        },
-        raw_new_token_event: msg,
-      });
-
       if (!NO_OPEN) openInBrowser(url);
+
+      // L'ouverture est immédiate ; l'écriture JSONL attend la fin du
+      // suivi post-match (voir en-tête du fichier) pour inclure la
+      // trajectoire complète et un verdict.
+      if (reason === 'complete') {
+        appendMatchRecord({
+          matched_at: new Date().toISOString(),
+          mint: msg.mint,
+          symbol: msg.symbol || null,
+          name: msg.name || null,
+          creator: msg.traderPublicKey ?? msg.creator ?? null,
+          axiom_url: url,
+          reason,
+          movement_sol: movedSol,
+          creation: {
+            market_cap_sol: marketCap,
+            creator_buy_sol: creatorBuy,
+            virtual_sol_reserves: baselineVSol,
+            virtual_token_reserves: Number(msg.vTokensInBondingCurve) || null,
+            is_mayhem_mode: mayhem,
+            metadata_uri: msg.uri || null,
+          },
+          at_match: { virtual_sol_reserves: state.virtual_quote_reserves_sol, virtual_token_reserves: state.virtual_token_reserves, complete: true },
+          post_match_track: [],
+          verdict: 'migré au moment du match',
+          raw_new_token_event: msg,
+        });
+        return;
+      }
+
+      console.log(`  [candidat ${candidateNum}] suivi post-match en cours (${POST_MATCH_DURATION_MS / 1000}s, ${POST_MATCH_POLL_INTERVAL_MS / 1000}s/point)...`);
+      trackPostMatch(msg.mint, state.virtual_quote_reserves_sol).then(({ track, peakVSol, migratedDuringTracking }) => {
+        const lastPoint = [...track].reverse().find((p) => typeof p.virtual_sol_reserves === 'number');
+        const finalVSol = lastPoint ? lastPoint.virtual_sol_reserves : null;
+        const verdict = computeVerdict({ baselineVSol, matchVSol: state.virtual_quote_reserves_sol, peakVSol, finalVSol, migratedDuringTracking });
+        console.log(`  [candidat ${candidateNum}] suivi terminé — verdict : ${verdict} (finalVSol=${fmt(finalVSol)}, peak=${fmt(peakVSol)})\n`);
+
+        appendMatchRecord({
+          matched_at: new Date().toISOString(),
+          mint: msg.mint,
+          symbol: msg.symbol || null,
+          name: msg.name || null,
+          creator: msg.traderPublicKey ?? msg.creator ?? null,
+          axiom_url: url,
+          reason,
+          movement_sol: movedSol,
+          creation: {
+            market_cap_sol: marketCap,
+            creator_buy_sol: creatorBuy,
+            virtual_sol_reserves: baselineVSol,
+            virtual_token_reserves: Number(msg.vTokensInBondingCurve) || null,
+            is_mayhem_mode: mayhem,
+            metadata_uri: msg.uri || null,
+          },
+          at_match: {
+            virtual_sol_reserves: state.virtual_quote_reserves_sol,
+            virtual_token_reserves: state.virtual_token_reserves,
+            complete: state.complete,
+          },
+          post_match_track: track,
+          verdict,
+          raw_new_token_event: msg,
+        });
+      });
     });
   });
 
