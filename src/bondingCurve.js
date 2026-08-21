@@ -22,12 +22,24 @@
 //   81     is_mayhem_mode (1 octet, bool)
 //   82     is_cashback_coin (1 octet, bool)
 //   83-114 quote_mint (32 octets, pubkey)
-//   115-150 padding / réservé (36 octets)
+//   115-150 padding / réservé (36 octets) — ABSENT avant migration (voir
+//   ci-dessous), donc jamais lu par decodeBondingCurve.
+//
+// Découverte le 2026-08-21 (premiers vrais snapshots en production, 80
+// erreurs "taille inattendue: 115 octets") : un compte PAS ENCORE migré
+// ne fait que 115 octets, pas 151 — le padding final (36 octets, soit
+// exactement 151-115) n'existe qu'après la migration, probablement
+// ajouté par une réallocation de compte au moment du "migrate". Tous les
+// champs qu'on lit s'arrêtent à l'octet 115 (fin de quote_mint), donc 115
+// octets suffisent dans les deux cas — le seuil minimal est fixé à 115,
+// pas 151.
 
 const { PublicKey } = require('@solana/web3.js');
 
 const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
-const EXPECTED_LAYOUT_BYTES = 151;
+// Taille minimale pour lire tous les champs jusqu'à quote_mint inclus
+// (offset 115) — pas 151, voir la découverte documentée ci-dessus.
+const MIN_LAYOUT_BYTES = 115;
 
 function deriveBondingCurvePda(mint) {
   const mintPubkey = new PublicKey(mint);
@@ -43,8 +55,8 @@ function deriveBondingCurvePda(mint) {
 // différent de ce qu'on attend) plutôt qu'un crash.
 function decodeBondingCurve(base64Data) {
   const buf = Buffer.from(base64Data, 'base64');
-  if (buf.length < EXPECTED_LAYOUT_BYTES) {
-    return { error: `taille inattendue: ${buf.length} octets (attendu ${EXPECTED_LAYOUT_BYTES})`, rawByteLength: buf.length };
+  if (buf.length < MIN_LAYOUT_BYTES) {
+    return { error: `taille inattendue: ${buf.length} octets (attendu au moins ${MIN_LAYOUT_BYTES})`, rawByteLength: buf.length };
   }
   let offset = 8; // discriminator Anchor
   const readU64 = () => {
