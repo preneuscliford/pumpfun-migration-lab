@@ -27,15 +27,13 @@ function requireEnv(name) {
 // trou.
 const PAGE_SIZE = 1000;
 
-async function fetchAllRows(supabase, table, select, orderColumn) {
+async function fetchAllRows(supabase, table, select, orderColumn, applyFilter) {
   const rows = [];
   let from = 0;
   for (;;) {
-    const { data, error } = await supabase
-      .from(table)
-      .select(select)
-      .order(orderColumn, { ascending: true })
-      .range(from, from + PAGE_SIZE - 1);
+    let query = supabase.from(table).select(select).order(orderColumn, { ascending: true }).range(from, from + PAGE_SIZE - 1);
+    if (applyFilter) query = applyFilter(query);
+    const { data, error } = await query;
     if (error) throw new Error(`lecture ${table}: ${error.message}`);
     rows.push(...data);
     if (data.length < PAGE_SIZE) break;
@@ -168,6 +166,23 @@ function printCategoricalDistribution(name, groups, extractor) {
   }
 }
 
+// Profil de référence : plages P10-P90 d'une feature, calculées sur UN
+// SEUL groupe (typiquement B, les migrés progressifs). Différent de
+// printFeatureDistribution (qui compare A/B/C côte à côte avec seulement
+// méd/P25/P75) — ici on veut la plage la plus large possible d'un seul
+// groupe, la matière première pour tout ce qu'on construira dessus. Pas
+// un seuil, pas un score : juste ce à quoi ressemblent, empiriquement,
+// les paramètres des tokens qui ont réellement migré.
+function printProfileStats(name, values) {
+  const clean = values.filter((v) => v !== null && v !== undefined && !Number.isNaN(v));
+  if (!clean.length) {
+    console.log(`  ${name.padEnd(38)} n=0`);
+    return;
+  }
+  const [p10, p25, p50, p75, p90] = [10, 25, 50, 75, 90].map((p) => fmt(percentile(clean, p), 2));
+  console.log(`  ${name.padEnd(38)} n=${String(clean.length).padStart(4)}  P10=${p10} P25=${p25} P50=${p50} P75=${p75} P90=${p90}`);
+}
+
 async function main() {
   const supabase = createClient(requireEnv('SUPABASE_URL'), requireEnv('SUPABASE_SERVICE_KEY'), {
     auth: { persistSession: false },
@@ -273,6 +288,61 @@ async function main() {
   });
 
   console.log('\n  métadonnées (has_twitter/has_telegram/has_website) : non renseigné en V1, pas encore comparable');
+
+  // Profil de référence groupe B seul (pas une comparaison A/B/C) : la
+  // matière première pour tout système futur basé sur les paramètres des
+  // tokens réellement migrés progressivement. Toujours aucun seuil, aucun
+  // score, aucune décision ici — juste caractériser ce groupe.
+  console.log('\n' + '='.repeat(72));
+  console.log(`PROFIL DE RÉFÉRENCE — GROUPE B seul, migration progressive (n=${targetCount})`);
+  console.log('  Plages P10-P90 sur les tokens RÉELLEMENT migrés progressivement');
+  console.log('  uniquement — pas un seuil, pas un score, pas une comparaison ici.');
+  console.log('='.repeat(72));
+
+  const bTokens = groups[1].tokens;
+  console.log('\nÀ la création :');
+  printProfileStats('initial_market_cap_sol', bTokens.map((t) => t.initial_market_cap_sol));
+  printProfileStats('initial_virtual_sol_reserves', bTokens.map((t) => t.initial_virtual_sol_reserves));
+  printProfileStats('initial_virtual_token_reserves', bTokens.map((t) => t.initial_virtual_token_reserves));
+  printProfileStats('solAmount (achat créateur, SOL)', bTokens.map((t) => rawNumField(t, 'solAmount')));
+  printProfileStats('initialBuy (achat créateur, tokens)', bTokens.map((t) => rawNumField(t, 'initialBuy')));
+  const bMayhemKnown = bTokens.filter((t) => t.raw_new_token_event && typeof t.raw_new_token_event.is_mayhem_mode === 'boolean');
+  const bMayhemTrue = bMayhemKnown.filter((t) => t.raw_new_token_event.is_mayhem_mode === true).length;
+  console.log(
+    `  ${'is_mayhem_mode=true'.padEnd(38)} ${bMayhemKnown.length ? `${bMayhemTrue}/${bMayhemKnown.length} (${((bMayhemTrue / bMayhemKnown.length) * 100).toFixed(1)}%)` : 'n=0'}`
+  );
+
+  if (bTokens.length) {
+    const bMints = bTokens.map((t) => t.mint);
+    const bSnapshots = await fetchAllRows(
+      supabase,
+      'token_snapshots',
+      'mint, age_seconds, virtual_sol_reserves, virtual_token_reserves',
+      'id',
+      (q) => q.in('mint', bMints)
+    );
+    // Regroupement par délai nominal le plus proche (30s/1min/3min/5min,
+    // voir listener.js) : age_seconds réel varie légèrement autour de la
+    // cible à cause de la latence RPC, pas la peine d'exiger une valeur
+    // exacte pour regrouper les points comparables entre eux.
+    const NOMINAL_DELAYS_S = [30, 60, 180, 300];
+    const byDelay = new Map(NOMINAL_DELAYS_S.map((d) => [d, []]));
+    for (const s of bSnapshots) {
+      const nearest = NOMINAL_DELAYS_S.reduce((a, b) => (Math.abs(b - s.age_seconds) < Math.abs(a - s.age_seconds) ? b : a));
+      byDelay.get(nearest).push(s);
+    }
+    console.log('\nTrajectoire de bonding curve (regroupée par délai nominal le plus proche) :');
+    console.log('  0/0 attendu dès que le snapshot tombe après la migration (compte vidé —');
+    console.log('  voir la validation dans scripts/check-bonding-curve-rpc.js).');
+    for (const d of NOMINAL_DELAYS_S) {
+      const pts = byDelay.get(d);
+      console.log(`\n  ~${d}s (n=${pts.length}) :`);
+      printProfileStats('virtual_sol_reserves', pts.map((p) => p.virtual_sol_reserves));
+      printProfileStats('virtual_token_reserves', pts.map((p) => p.virtual_token_reserves));
+    }
+  } else {
+    console.log('\nAucun token du groupe B pour le moment — pas de trajectoire à profiler.');
+  }
 
   const log = await fetchAllRows(supabase, 'ingestion_log', 'event_type, at, id', 'id');
 
