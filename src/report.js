@@ -18,6 +18,32 @@ function requireEnv(name) {
   return v;
 }
 
+// PostgREST plafonne chaque requête à 1000 lignes par défaut — sans
+// pagination, tokens/ingestion_log se retrouvaient silencieusement
+// tronqués dès qu'on dépassait 1000 lignes (repéré le 2026-08-21 : le
+// rapport annonçait ~1000 tokens alors que la collecte en avait déjà
+// plusieurs milliers). orderColumn doit être une colonne unique (clé
+// primaire) pour que .range() donne des pages stables sans doublon ni
+// trou.
+const PAGE_SIZE = 1000;
+
+async function fetchAllRows(supabase, table, select, orderColumn) {
+  const rows = [];
+  let from = 0;
+  for (;;) {
+    const { data, error } = await supabase
+      .from(table)
+      .select(select)
+      .order(orderColumn, { ascending: true })
+      .range(from, from + PAGE_SIZE - 1);
+    if (error) throw new Error(`lecture ${table}: ${error.message}`);
+    rows.push(...data);
+    if (data.length < PAGE_SIZE) break;
+    from += PAGE_SIZE;
+  }
+  return rows;
+}
+
 function mean(arr) {
   return arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : null;
 }
@@ -147,8 +173,7 @@ async function main() {
     auth: { persistSession: false },
   });
 
-  const { data: allTokens, error } = await supabase.from('tokens').select('*');
-  if (error) throw new Error(`lecture tokens: ${error.message}`);
+  const allTokens = await fetchAllRows(supabase, 'tokens', '*', 'mint');
 
   // On ne garde que les tokens dont on a réellement vu l'événement de
   // création : sans lui, on ne connaît ni son âge réel ni ses features de
@@ -249,8 +274,7 @@ async function main() {
 
   console.log('\n  métadonnées (has_twitter/has_telegram/has_website) : non renseigné en V1, pas encore comparable');
 
-  const { data: log, error: logError } = await supabase.from('ingestion_log').select('event_type, at').order('at', { ascending: true });
-  if (logError) throw new Error(`lecture ingestion_log: ${logError.message}`);
+  const log = await fetchAllRows(supabase, 'ingestion_log', 'event_type, at, id', 'id');
 
   const counts = {};
   for (const l of log || []) counts[l.event_type] = (counts[l.event_type] || 0) + 1;
