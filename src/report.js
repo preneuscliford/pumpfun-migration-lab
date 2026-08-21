@@ -47,28 +47,34 @@ async function main() {
     auth: { persistSession: false },
   });
 
-  const { data: tokens, error } = await supabase.from('tokens').select('*');
+  const { data: allTokens, error } = await supabase.from('tokens').select('*');
   if (error) throw new Error(`lecture tokens: ${error.message}`);
+
+  // On ne garde que les tokens dont on a réellement vu l'événement de
+  // création : sans lui, on ne connaît ni son âge réel ni ses features de
+  // départ (market cap initial, réserves...), et on ne peut même pas
+  // savoir s'il existait déjà avant qu'on commence à écouter. Les inclure
+  // fausserait le taux de migration et toute comparaison de features.
+  const creationMissedCount = allTokens.filter((t) => !t.raw_new_token_event).length;
+  const tokens = allTokens.filter((t) => t.raw_new_token_event);
 
   const total = tokens.length;
   const migrated = tokens.filter((t) => t.migrated);
   const nonMigrated = tokens.filter((t) => !t.migrated);
-  const creationMissed = tokens.filter((t) => !t.raw_new_token_event);
   const observationClosed = nonMigrated.filter((t) => t.observation_closed_at);
   const stillOpen = nonMigrated.filter((t) => !t.observation_closed_at);
 
   console.log('='.repeat(72));
   console.log(`Rapport pumpfun-migration-lab — ${new Date().toISOString()}`);
   console.log('='.repeat(72));
-  console.log(`Tokens observés au total : ${total}`);
+  console.log(`Tokens avec création observée : ${total} (${creationMissedCount} exclu(s) — création jamais vue, pas d'âge/features fiables)`);
   console.log(`  migrés            : ${migrated.length}${total ? ` (${((migrated.length / total) * 100).toFixed(2)}%)` : ''}`);
   console.log(`  non migrés        : ${nonMigrated.length} (dont ${stillOpen.length} encore dans leur fenêtre de 6h, ${observationClosed.length} fenêtre fermée)`);
-  console.log(`  création manquée  : ${creationMissed.length} (vus seulement via leur événement de migration)`);
 
   const ttms = migrated.map((t) => t.time_to_migration_seconds).filter((v) => v !== null && v !== undefined);
   if (ttms.length) {
     console.log(
-      `\nDélai de migration (n=${ttms.length}, exclut les créations manquées) : ` +
+      `\nDélai de migration (n=${ttms.length}) : ` +
         `moyenne ${fmt(mean(ttms), 0)}s | médiane ${fmt(median(ttms), 0)}s | min ${Math.min(...ttms)}s | max ${Math.max(...ttms)}s`
     );
   } else {
