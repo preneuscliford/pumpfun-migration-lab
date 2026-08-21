@@ -4,6 +4,9 @@
   "private": true,
   "description": "Laboratoire de recherche (sans capital) sur les tokens Pump.fun/Solana : dataset des créations et migrations.",
   "type": "commonjs",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "listen": "node src/listener.js"
   },
