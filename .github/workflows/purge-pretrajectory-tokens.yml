@@ -1,0 +1,34 @@
+name: Purge tokens antérieurs à la capture de trajectoire (usage unique)
+
+on:
+  workflow_dispatch:
+    inputs:
+      cutoff_iso:
+        description: 'Supprime les tokens avec ingested_at < cette date (RFC3339, ex. 2026-08-21T12:42:03Z)'
+        required: true
+      confirm:
+        description: "Doit valoir exactement: yes-delete-pretrajectory-tokens"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - run: npm ci
+
+      - name: Run purge
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          CUTOFF_ISO: ${{ inputs.cutoff_iso }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: node scripts/purge-pretrajectory-tokens.js
