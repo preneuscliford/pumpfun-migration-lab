@@ -95,10 +95,11 @@ function sleep(ms) {
 }
 
 // Écart minimum (en SOL) par rapport à l'état annoncé à la création pour
-// considérer que la bonding curve a réellement bougé — au-dessus du bruit
-// de quelques lamports qu'on observe même sur des tokens totalement
-// inactifs (voir report.js / inspect-trajectories.js).
-const MOVEMENT_THRESHOLD_SOL = 0.05;
+// considérer que la bonding curve a réellement bougé. Réglé à 5 SOL sur
+// demande (2026-08-21) — bien au-dessus du bruit de quelques lamports
+// observé même sur des tokens inactifs, ça vise une vraie traction, pas
+// juste "quelqu'un a acheté un peu".
+const MOVEMENT_THRESHOLD_SOL = 5;
 const MOVEMENT_POLL_INTERVAL_MS = 2000;
 const MOVEMENT_MAX_WAIT_MS = 60000;
 
