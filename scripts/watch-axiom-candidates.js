@@ -76,6 +76,15 @@
 // temps en le relisant, pas une décision automatique : c'est vous qui
 // jugez en le regardant sur Axiom.
 //
+// Concentration des détenteurs ajoutée dans la foulée (même échange,
+// "trop d'acheteurs... des wallets qui achètent dès le mouvement du
+// token et détiennent une part significative, ça peut [ressembler à du]
+// sniper" — préoccupation snipers/bots). Au moment du match, lit via
+// src/holders.js qui détient réellement le token (getTokenLargestAccounts,
+// compte de la bonding curve exclu) et quelle part de l'offre totale ça
+// représente — descriptif, n'empêche jamais l'ouverture, juste ajouté aux
+// logs et au JSONL (holders_at_match).
+//
 // Usage : node scripts/watch-axiom-candidates.js
 // (Ctrl+C pour arrêter — tourne indéfiniment tant que vous le laissez.
 // Les matchs dont le suivi post-match n'est pas terminé au moment du
@@ -85,7 +94,8 @@ const fs = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
 const { exec } = require('child_process');
-const { fetchBondingCurveState } = require('../src/bondingCurve');
+const { fetchBondingCurveState, deriveBondingCurvePda } = require('../src/bondingCurve');
+const { fetchHolderConcentration } = require('../src/holders');
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const DATA_FILE = path.join(DATA_DIR, 'axiom-matches.jsonl');
@@ -212,6 +222,21 @@ function computeVerdict({ baselineVSol, matchVSol, peakVSol, finalVSol, migrated
   return 'repli partiel';
 }
 
+// Concentration des détenteurs au moment du match (voir src/holders.js) :
+// beaucoup de wallets qui achètent dès le mouvement et détiennent une
+// part significative du token peut indiquer des snipers/bots plutôt
+// qu'un intérêt organique. Descriptif, pas un filtre — n'empêche pas
+// l'ouverture, juste ajouté aux logs/au JSONL pour votre lecture.
+// N'échoue jamais bruyamment : un problème RPC ici ne doit pas faire
+// perdre le match lui-même.
+async function fetchHolderSummary(mint, bondingCurvePda) {
+  try {
+    return await fetchHolderConcentration(SOLANA_RPC_URL, mint, bondingCurvePda);
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
 function openInBrowser(url) {
   const cmd =
     process.platform === 'win32' ? `start "" "${url}"` : process.platform === 'darwin' ? `open "${url}"` : `xdg-open "${url}"`;
@@ -256,11 +281,12 @@ function main() {
     candidate += 1;
     const candidateNum = candidate;
     const baselineVSol = Number(msg.vSolInBondingCurve);
+    const { pda: bondingCurvePda } = deriveBondingCurvePda(msg.mint);
     console.log(
       `[candidat ${candidateNum}] ${msg.symbol || '(sans symbole)'} — ${msg.mint} — vSol création=${fmt(baselineVSol)} SOL, surveillance jusqu'à mouvement (max ${MOVEMENT_MAX_WAIT_MS / 1000}s)...`
     );
 
-    waitForMovement(msg.mint, baselineVSol).then(({ state, reason }) => {
+    waitForMovement(msg.mint, baselineVSol).then(async ({ state, reason }) => {
       if (reason === 'timeout') {
         console.log(`  [candidat ${candidateNum}] abandonné : aucun mouvement détecté en ${MOVEMENT_MAX_WAIT_MS / 1000}s.\n`);
         return;
@@ -272,6 +298,15 @@ function main() {
       console.log(`[MATCH ${matched}] ${msg.symbol || '(sans symbole)'} — ${msg.mint} — ${why}`);
       console.log(`  à la création (WS) : market_cap=${marketCap} SOL  achat_créateur=${creatorBuy} SOL  vSol=${fmt(baselineVSol)}  is_mayhem_mode=${mayhem === null ? 'n/a' : mayhem}`);
       console.log(`  on-chain (RPC, maintenant) : vSol=${state.virtual_quote_reserves_sol}  vToken=${state.virtual_token_reserves}  complete=${state.complete}`);
+
+      const holders = await fetchHolderSummary(msg.mint, bondingCurvePda);
+      if (holders.error) {
+        console.log(`  détenteurs : lecture échouée (${holders.error})`);
+      } else {
+        console.log(
+          `  détenteurs : ${holders.top_holders_count} wallet(s) hors curve détiennent ${fmt(holders.top_holders_pct_of_supply, 1)}% de l'offre totale`
+        );
+      }
       console.log(`  -> ${url}${NO_OPEN ? '  (AXIOM_NO_OPEN=1 : pas ouvert)' : ''}\n`);
       if (!NO_OPEN) openInBrowser(url);
 
@@ -297,6 +332,7 @@ function main() {
             metadata_uri: msg.uri || null,
           },
           at_match: { virtual_sol_reserves: state.virtual_quote_reserves_sol, virtual_token_reserves: state.virtual_token_reserves, complete: true },
+          holders_at_match: holders,
           post_match_track: [],
           verdict: 'migré au moment du match',
           raw_new_token_event: msg,
@@ -333,6 +369,7 @@ function main() {
             virtual_token_reserves: state.virtual_token_reserves,
             complete: state.complete,
           },
+          holders_at_match: holders,
           post_match_track: track,
           verdict,
           raw_new_token_event: msg,
