@@ -1,0 +1,25 @@
+name: Inspect bonding curve snapshot errors (diagnostic, read-only)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - run: npm ci
+
+      - name: Run inspection
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: node scripts/inspect-snapshot-errors.js
