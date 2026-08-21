@@ -62,10 +62,56 @@ async function main() {
     }
   }
 
+  // Section dédiée groupe B (migration progressive, >10s) : la requête
+  // ci-dessus ne prend que les 500 snapshots les plus RÉCENTS, donc
+  // biaisée vers les tokens tout juste créés — la plupart pas encore
+  // migrés. On cible ici explicitement les tokens déjà migrés
+  // progressivement pour voir une vraie trajectoire du groupe qui nous
+  // intéresse.
+  const { data: migratedB, error: migError } = await supabase
+    .from('tokens')
+    .select('mint, symbol, migrated_at, time_to_migration_seconds')
+    .eq('migrated', true)
+    .gt('time_to_migration_seconds', 10)
+    .order('time_to_migration_seconds', { ascending: true })
+    .limit(10);
+  if (migError) throw new Error(`lecture tokens migrés: ${migError.message}`);
+
+  console.log('\n' + '='.repeat(72));
+  console.log(`Groupe B (migration progressive >10s) — ${migratedB.length} candidat(s) trouvé(s) :`);
+  console.log('='.repeat(72));
+
+  if (!migratedB.length) {
+    console.log('Aucun token du groupe B pour le moment — encore trop tôt.');
+  } else {
+    const { data: bSnapshots, error: bSnapError } = await supabase
+      .from('token_snapshots')
+      .select('mint, age_seconds, virtual_sol_reserves, virtual_token_reserves')
+      .in('mint', migratedB.map((t) => t.mint))
+      .order('age_seconds', { ascending: true });
+    if (bSnapError) throw new Error(`lecture snapshots groupe B: ${bSnapError.message}`);
+
+    const bByMint = new Map();
+    for (const s of bSnapshots) {
+      if (!bByMint.has(s.mint)) bByMint.set(s.mint, []);
+      bByMint.get(s.mint).push(s);
+    }
+
+    for (const t of migratedB) {
+      const points = bByMint.get(t.mint) || [];
+      console.log(`\n${t.mint} — ${t.symbol || '(sans symbole)'} — migré en ${t.time_to_migration_seconds}s (${points.length} snapshot(s))`);
+      for (const p of points) {
+        console.log(`  age=${String(p.age_seconds).padStart(4)}s  vSol=${p.virtual_sol_reserves}  vToken=${p.virtual_token_reserves}`);
+      }
+      if (!points.length) console.log('  (aucun snapshot capturé pour ce token)');
+    }
+  }
+
   const { count: totalSnapshots } = await supabase.from('token_snapshots').select('id', { count: 'exact', head: true });
   const { count: totalTokens } = await supabase.from('tokens').select('mint', { count: 'exact', head: true });
+  const { count: migratedCount } = await supabase.from('tokens').select('mint', { count: 'exact', head: true }).eq('migrated', true);
   console.log('\n' + '='.repeat(72));
-  console.log(`Total : ${totalTokens} tokens, ${totalSnapshots} snapshots.`);
+  console.log(`Total : ${totalTokens} tokens, ${totalSnapshots} snapshots, ${migratedCount} migrés (tous groupes).`);
 }
 
 main().catch((err) => {
