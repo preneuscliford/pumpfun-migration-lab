@@ -1,0 +1,14 @@
+{
+  "name": "pumpfun-migration-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Laboratoire de recherche (sans capital) sur les tokens Pump.fun/Solana : dataset des créations et migrations.",
+  "type": "commonjs",
+  "scripts": {
+    "listen": "node src/listener.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,32 @@
+name: Listener
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write # nécessaire pour que le script puisse se relancer lui-même
+
+concurrency:
+  group: pumpfun-listener
+  cancel-in-progress: false
+
+jobs:
+  listen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355 # 5h55 — sous la limite dure de 360 min (6h) des runners GitHub-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - run: npm ci
+
+      - name: Run listener
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node src/listener.js

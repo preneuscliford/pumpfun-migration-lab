@@ -1,0 +1,39 @@
+name: Watchdog
+
+# Filet de sécurité pour la chaîne de relais du listener (voir listener.js
+# et README) : si le listener ne s'est pas relancé lui-même (crash avant
+# la relance, échec réseau ponctuel de l'appel API, etc.), ce job détecte
+# qu'aucun run n'est en cours et en déclenche un nouveau. Job volontairement
+# minimal (pas de checkout/npm) pour rester rapide et économe.
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Vérifie si le listener tourne, sinon le relance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          RUNNING=$(curl -sS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/listener.yml/runs?status=in_progress&per_page=1" \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{console.log(JSON.parse(d).total_count)}catch{console.log('ERR')}})")
+          echo "Runs listener en cours : $RUNNING"
+          if [ "$RUNNING" = "0" ]; then
+            echo "Aucun run en cours — relance du listener"
+            curl -sS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/listener.yml/dispatches" \
+              -d '{"ref":"main"}'
+          fi
