@@ -17,7 +17,14 @@ create table if not exists tokens (
   symbol text,
   name text,
   creator text,
-  created_at timestamptz not null default now(),
+  -- PAS de "not null default now()" : created_at ne doit être posé que
+  -- quand on observe réellement l'événement de création (buildTokenRow
+  -- le fait explicitement dans src/listener.js). Un token dont on n'a vu
+  -- que la migration (création manquée, ex. trou de connexion) doit avoir
+  -- created_at NULL, pas une valeur bidon proche de migrated_at — sinon
+  -- time_to_migration_seconds sort un chiffre proche de 0 voire négatif
+  -- au lieu de NULL (bug constaté en prod : -9s, corrigé le 2026-08-21).
+  created_at timestamptz,
 
   -- État initial de la bonding curve au moment de la création — les
   -- "features statiques" sur lesquelles porte l'expérience V1.
@@ -41,7 +48,7 @@ create table if not exists tokens (
   -- migration d'un même token sont vues par deux runs différents (relais
   -- GitHub Actions) qui ne partagent pas de mémoire.
   time_to_migration_seconds integer generated always as (
-    case when migrated_at is not null
+    case when migrated_at is not null and created_at is not null
       then (extract(epoch from (migrated_at - created_at)))::int
     end
   ) stored,
