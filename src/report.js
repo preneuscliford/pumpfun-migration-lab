@@ -314,13 +314,24 @@ async function main() {
 
   if (bTokens.length) {
     const bMints = bTokens.map((t) => t.mint);
-    const bSnapshots = await fetchAllRows(
-      supabase,
-      'token_snapshots',
-      'mint, age_seconds, virtual_sol_reserves, virtual_token_reserves',
-      'id',
-      (q) => q.in('mint', bMints)
-    );
+    // .in('mint', bMints) sur des centaines de mints dépasse la longueur
+    // d'URL acceptée par PostgREST ("Bad Request", repéré le 2026-08-23
+    // avec n=900) — on découpe en lots plutôt que d'envoyer un seul filtre
+    // géant. La taille de lot (150) est un compromis prudent, pas une
+    // valeur mesurée précisément.
+    const MINT_BATCH_SIZE = 150;
+    const bSnapshots = [];
+    for (let i = 0; i < bMints.length; i += MINT_BATCH_SIZE) {
+      const batch = bMints.slice(i, i + MINT_BATCH_SIZE);
+      const rows = await fetchAllRows(
+        supabase,
+        'token_snapshots',
+        'mint, age_seconds, virtual_sol_reserves, virtual_token_reserves',
+        'id',
+        (q) => q.in('mint', batch)
+      );
+      bSnapshots.push(...rows);
+    }
     // Regroupement par délai nominal le plus proche (30s/1min/3min/5min,
     // voir listener.js) : age_seconds réel varie légèrement autour de la
     // cible à cause de la latence RPC, pas la peine d'exiger une valeur
