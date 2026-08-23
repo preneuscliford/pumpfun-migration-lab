@@ -142,6 +142,11 @@ wss.on('connection', (socket) => {
   });
 
   // Envoie un faux événement de création peu après la connexion.
+  // vSolInBondingCurve délibérément DIFFÉRENT des 30 SOL renvoyés par le
+  // faux RPC (buildFakeBondingCurveAccountBase64) — écart relatif de 50%,
+  // très au-dessus d'ACTIVITY_REL_DEV_THRESHOLD, pour que ce token soit
+  // jugé "actif" au gate et exerce la cascade étendue + les holders (gatés
+  // sur l'activité depuis la V2).
   setTimeout(() => {
     socket.send(
       JSON.stringify({
@@ -150,7 +155,7 @@ wss.on('connection', (socket) => {
         name: 'Test Token',
         symbol: 'TEST',
         traderPublicKey: 'FakeDevWallet',
-        vSolInBondingCurve: '30',
+        vSolInBondingCurve: '20',
         vTokensInBondingCurve: '1000000000',
         marketCapSol: '27',
         bondingCurveKey: 'FakeCurve',
@@ -190,8 +195,13 @@ async function main() {
       SUPABASE_SERVICE_KEY: 'fake-key-for-test',
       PUMPPORTAL_WS_URL: `ws://127.0.0.1:${wsPort}`,
       SOLANA_RPC_URL: `http://127.0.0.1:${rpcPort}`,
-      BONDING_CURVE_SNAPSHOT_DELAYS_MS: '50',
-      HOLDERS_SNAPSHOT_DELAY_MS: '50',
+      // Cascade V2 en secondes (fractionnaires ici pour rester rapide en
+      // test) : gate à 100/150/200ms, étendue à 300/350/400/450ms — la
+      // longue traîne (10s+) ne doit jamais se déclencher dans la fenêtre
+      // du test, volontairement hors de portée de MAX_RUNTIME_MS ci-dessous.
+      GATE_DELAYS_S: '0.1,0.15,0.2',
+      EXTENDED_DELAYS_S: '0.3,0.35,0.4,0.45',
+      LONG_TAIL_DELAYS_S: '10,20,30,40,50',
       BONDING_CURVE_RPC_MIN_INTERVAL_MS: '10',
       MAX_RUNTIME_MS: '2500',
       RELAY_CHECK_INTERVAL_MS: '500',
@@ -232,7 +242,9 @@ async function main() {
   assert.ok(subscriptions.includes('subscribeMigration'), 'devrait avoir envoyé subscribeMigration');
   assert.ok(reconnected, 'devrait s\'être reconnecté après la coupure forcée');
 
-  const tokensCalls = httpRequests.filter((r) => r.url.includes('/tokens'));
+  // POST uniquement (upsert) : exclut les GET (.select().maybeSingle() de
+  // updateTokenDerivedMetrics, corps vide) qui touchent aussi /tokens.
+  const tokensCalls = httpRequests.filter((r) => r.url.includes('/tokens') && r.method === 'POST');
   assert.ok(tokensCalls.length >= 2, `devrait avoir au moins 2 appels vers tokens (création + migration), obtenu ${tokensCalls.length}`);
   const createdRow = JSON.parse(tokensCalls[0].body);
   assert.strictEqual(createdRow[0].mint, fakeMint);
@@ -249,36 +261,51 @@ async function main() {
   const relayLog = httpRequests.find((r) => r.url.includes('/ingestion_log') && r.body.includes('relay_handoff'));
   assert.ok(relayLog, 'la fin de run devrait logguer relay_handoff');
 
-  // Trajectoire de la bonding curve : le délai de snapshot est raccourci à
-  // 50ms (BONDING_CURVE_SNAPSHOT_DELAYS_MS), donc un seul snapshot est
-  // attendu, tiré peu après la création — vérifie que le listener a bien
-  // appelé le faux RPC (getAccountInfo) et écrit la ligne décodée.
-  assert.ok(
-    rpcRequests.some((r) => r.method === 'getAccountInfo'),
-    'le listener devrait avoir appelé getAccountInfo pour lire la bonding curve'
-  );
-  const snapshotCall = httpRequests.find((r) => r.url.includes('/token_snapshots'));
-  assert.ok(snapshotCall, 'devrait avoir écrit un snapshot dans token_snapshots');
+  // Cascade V2 : le token est actif dès le gate (vSolInBondingCurve=20 vs
+  // 30 SOL renvoyés par le faux RPC, 50% d'écart) donc gate ET étendue
+  // doivent tourner — au moins 7 lectures bonding curve (3 gate + 4
+  // étendue), la longue traîne (10s+) hors de portée du test.
+  const bondingCurveReads = rpcRequests.filter((r) => r.method === 'getAccountInfo' && r.params?.[1]?.encoding === 'base64');
+  assert.ok(bondingCurveReads.length >= 7, `attendu >=7 lectures bonding curve (gate+étendue), obtenu ${bondingCurveReads.length}`);
+
+  const snapshotCalls = httpRequests.filter((r) => r.url.includes('/token_snapshots'));
+  assert.ok(snapshotCalls.length >= 7, `attendu >=7 snapshots écrits, obtenu ${snapshotCalls.length}`);
   // insertSnapshot() envoie un objet unique (comme logIngestion), pas un
   // tableau (contrairement à upsertNewTokens/upsertMigrations) — pas de [0].
-  const snapshotRow = JSON.parse(snapshotCall.body);
-  assert.strictEqual(snapshotRow.mint, fakeMint);
-  assert.strictEqual(snapshotRow.virtual_sol_reserves, 30); // 30000000000 lamports / 1e9, voir buildFakeBondingCurveAccountBase64
-  assert.strictEqual(snapshotRow.virtual_token_reserves, '1073000000000000');
-  assert.ok(typeof snapshotRow.age_seconds === 'number' && snapshotRow.age_seconds >= 0, 'age_seconds devrait être un entier positif');
+  const snapshotRows = snapshotCalls.map((c) => JSON.parse(c.body));
+  for (const row of snapshotRows) {
+    assert.strictEqual(row.mint, fakeMint);
+    assert.strictEqual(row.virtual_sol_reserves, 30); // 30000000000 lamports / 1e9, voir buildFakeBondingCurveAccountBase64
+    assert.strictEqual(row.virtual_token_reserves, '1073000000000000');
+    assert.ok(typeof row.age_seconds === 'number' && row.age_seconds >= 0, 'age_seconds devrait être un entier positif');
+  }
+  // nominal_delay_s couvre à la fois le gate (0.1/0.15/0.2) et l'étendue
+  // (0.3/0.35/0.4/0.45) — preuve que le token classé actif a bien continué
+  // au-delà du gate plutôt que de s'arrêter à 3 lectures.
+  const nominalDelays = snapshotRows.map((r) => r.nominal_delay_s).sort((a, b) => a - b);
+  assert.ok(nominalDelays.includes(0.1) && nominalDelays.includes(0.3), `attendu des lectures gate ET étendue, obtenu ${nominalDelays.join(',')}`);
 
-  // Concentration des holders : HOLDERS_SNAPSHOT_DELAY_MS=50 coïncide avec
-  // l'unique délai de snapshot testé, donc ce même snapshot doit porter les
-  // colonnes holders — vérifie que le listener a bien appelé getTokenLargestAccounts/
-  // getTokenSupply et exclu le compte de la curve (fakeCurveAta) du calcul.
+  // Concentration des holders : gatée sur l'activité depuis la V2, capturée
+  // au premier point de la cascade étendue (0.3s) — un seul snapshot doit
+  // porter les colonnes holders, pas tous.
   assert.ok(
     rpcRequests.some((r) => r.method === 'getTokenLargestAccounts'),
     'le listener devrait avoir appelé getTokenLargestAccounts pour les holders'
   );
-  assert.strictEqual(snapshotRow.total_supply, 1000000000000000);
-  assert.strictEqual(snapshotRow.curve_held_amount, 793100000000000, 'devrait identifier fakeCurveAta comme le compte de la curve');
-  assert.strictEqual(snapshotRow.top_holders_count, 1, 'devrait exclure fakeCurveAta et ne garder que le vrai holder');
-  assert.ok(Math.abs(snapshotRow.top_holders_pct_of_supply - 0.0005) < 1e-6, `top_holders_pct_of_supply inattendu: ${snapshotRow.top_holders_pct_of_supply}`);
+  const holdersRow = snapshotRows.find((r) => r.total_supply != null);
+  assert.ok(holdersRow, 'un des snapshots devrait porter les données holders');
+  assert.strictEqual(holdersRow.nominal_delay_s, 0.3, 'les holders devraient être capturés au premier point de la cascade étendue');
+  assert.strictEqual(holdersRow.total_supply, 1000000000000000);
+  assert.strictEqual(holdersRow.curve_held_amount, 793100000000000, 'devrait identifier fakeCurveAta comme le compte de la curve');
+  assert.strictEqual(holdersRow.top_holders_count, 1, 'devrait exclure fakeCurveAta et ne garder que le vrai holder');
+  assert.ok(Math.abs(holdersRow.top_holders_pct_of_supply - 0.0005) < 1e-6, `top_holders_pct_of_supply inattendu: ${holdersRow.top_holders_pct_of_supply}`);
+  assert.strictEqual(snapshotRows.filter((r) => r.total_supply != null).length, 1, 'les holders ne doivent être capturés qu\'une seule fois par token');
+
+  // Métriques dérivées recopiées sur tokens en direct (updateTokenDerivedMetrics).
+  const derivedUpdateCalls = httpRequests.filter(
+    (r) => r.url.includes('/tokens') && r.method === 'PATCH' && (r.body.includes('bc_ratio_t') || r.body.includes('bc_cascade_reads'))
+  );
+  assert.ok(derivedUpdateCalls.length >= 7, `attendu >=7 mises à jour des métriques dérivées, obtenu ${derivedUpdateCalls.length}`);
 
   console.log('\nTOUS LES TESTS D\'INTEGRATION OK');
   console.log(`(${httpRequests.length} requêtes HTTP reçues, ${rpcRequests.length} requêtes RPC reçues, subscriptions=${subscriptions.join(',')}, reconnecté=${reconnected})`);

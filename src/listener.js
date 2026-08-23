@@ -6,16 +6,42 @@
 // wallet : ce script lit un flux public, plus quelques appels RPC Solana
 // publics en lecture seule, et écrit dans Supabase.
 //
-// Expérience "trajectoire de la bonding curve" (2026-08-21) : pour chaque
-// token créé, on programme 4 lectures ponctuelles de sa bonding curve via
-// RPC Solana public (getAccountInfo, voir src/bondingCurve.js) à délais
-// fixes après la création — pas de polling continu, pas de
-// subscribeTokenTrade, pas de reconstruction via l'historique de
-// transactions. Objectif unique : voir si la progression vQuote/vToken à
-// 1/3/5min distingue les migrations progressives (groupe B, >10s) des
-// tokens qui ne migreront jamais (groupe C, témoin). Le calcul de la
-// progression elle-même se fait dans report.js, pas ici — le listener ne
-// fait qu'enregistrer les points de mesure bruts dans token_snapshots.
+// Cascade V2 à gate d'activité (2026-08-23), remplace la cascade fixe à 4
+// points du 2026-08-21 — objectif inchangé : voir si la progression de la
+// bonding curve distingue les migrations progressives (groupe B, >10s) des
+// tokens qui ne migreront jamais (groupe C, témoin), sans exploser le
+// quota Supabase Free ni le RPC public gratuit pour la majorité des
+// tokens qui ne migreront jamais. Toujours pas de subscribeTokenTrade, pas
+// de reconstruction via l'historique de transactions.
+//
+//   1. Gate universel (TOUS les tokens) : lectures à GATE_DELAYS_S.
+//   2. Une lecture dépasse ACTIVITY_REL_DEV_THRESHOLD (écart relatif vs
+//      initial_virtual_sol_reserves) ? -> cascade étendue EXTENDED_DELAYS_S.
+//      Sinon, arrêt — pas la peine de suivre un token qui n'a montré aucun
+//      mouvement dans les 10 premières secondes.
+//   3. Toujours actif à la fin de l'étendue ? -> longue traîne espacée
+//      LONG_TAIL_DELAYS_S. Arrêt immédiat, à tout moment, dès qu'une
+//      migration est détectée (subscribeMigration, temps réel — pas besoin
+//      d'attendre un snapshot pour l'apprendre) ou qu'une lecture montre
+//      complete=true / réserve à 0 (compte déjà vidé, rien à apprendre de
+//      plus).
+// Seuil calibré le 2026-08-23 sur les données réelles déjà collectées
+// (scripts/calibrate-activity-threshold.js) : le bruit flottant pur reste
+// sous 1e-8, la masse d'activité réelle démarre autour de 1e-4.
+//
+// Les holders (src/holders.js, ~20 appels RPC — bien plus cher qu'une
+// lecture de bonding curve) suivent le MÊME gate : capturés une seule fois,
+// au premier point de la cascade étendue, donc seulement pour les tokens
+// jugés actifs — pas pour tout le monde comme avant.
+//
+// Rétention à deux niveaux (voir sql/schema.sql) : les métriques utiles
+// (bc_ratio_t5s/t10s/t20s/t30s, bc_first_active_at_s, bc_peak_ratio) sont
+// recopiées sur tokens EN DIRECT à chaque lecture, pas recalculées après
+// coup — token_snapshots (détail brut) et raw_new_token_event/
+// raw_migration_event (JSON brut) peuvent donc être purgés après un délai
+// borné sans perdre l'essentiel. Purge par petits lots à chaque cycle de
+// nettoyage plutôt qu'en une fois (une suppression trop large dépasse le
+// statement timeout ou la longueur d'URL PostgREST — repéré le 2026-08-23).
 //
 // Contrainte GitHub Actions : un job est tué au bout de 6h. Ce script ne
 // tente donc pas de tourner en continu indéfiniment — il s'arrête
@@ -51,28 +77,52 @@ const RECONNECT_MAX_MS = Number(process.env.RECONNECT_MAX_MS) || 30_000;
 const OBSERVATION_WINDOW_MS = Number(process.env.OBSERVATION_WINDOW_MS) || 6 * 3600 * 1000;
 const RELAY_CHECK_INTERVAL_MS = Number(process.env.RELAY_CHECK_INTERVAL_MS) || 30_000;
 
-// Délais après création auxquels on lit la bonding curve (30s/1min/3min/
-// 5min par défaut — voir en-tête du fichier). Liste de millisecondes
-// séparées par des virgules.
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
-const BONDING_CURVE_SNAPSHOT_DELAYS_MS = (process.env.BONDING_CURVE_SNAPSHOT_DELAYS_MS || '30000,60000,180000,300000')
-  .split(',')
-  .map(Number)
-  .filter((n) => Number.isFinite(n) && n > 0);
-// Espacement minimum entre deux appels RPC bonding-curve, tous tokens
-// confondus — protège le RPC public gratuit d'un afflux de créations
-// groupées plutôt que de compter sur le hasard de l'espacement naturel.
+
+// Cascade V2 (voir en-tête du fichier) — délais en SECONDES (pas ms,
+// contrairement à l'ancienne BONDING_CURVE_SNAPSHOT_DELAYS_MS) séparés par
+// des virgules, surchargeables par variable d'environnement pour les tests
+// d'intégration locaux (voir test/) sans attendre les délais réels.
+function parseDelaysS(raw, fallback) {
+  if (!raw) return fallback;
+  const parsed = raw
+    .split(',')
+    .map(Number)
+    .filter((n) => Number.isFinite(n) && n > 0);
+  return parsed.length ? parsed : fallback;
+}
+const GATE_DELAYS_S = parseDelaysS(process.env.GATE_DELAYS_S, [2, 5, 10]);
+const EXTENDED_DELAYS_S = parseDelaysS(process.env.EXTENDED_DELAYS_S, [20, 30, 45, 60]);
+const LONG_TAIL_DELAYS_S = parseDelaysS(process.env.LONG_TAIL_DELAYS_S, [120, 300, 600, 1200, 1800]);
+
+// Seuil d'écart relatif |observé - initial_virtual_sol_reserves| /
+// initial_virtual_sol_reserves au-delà duquel un token est jugé "actif" et
+// passe à la cascade étendue. Calibré le 2026-08-23 sur les snapshots déjà
+// collectés (scripts/calibrate-activity-threshold.js) : le bruit flottant
+// pur reste sous 1e-8, la masse d'activité réelle démarre autour de 1e-4 —
+// séparation nette entre les deux.
+const ACTIVITY_REL_DEV_THRESHOLD = Number(process.env.ACTIVITY_REL_DEV_THRESHOLD) || 1e-4;
+
+// Espacement minimum entre deux appels RPC bonding-curve/holders, tous
+// tokens confondus — protège le RPC public gratuit d'un afflux de
+// créations groupées plutôt que de compter sur le hasard de l'espacement
+// naturel.
 const BONDING_CURVE_RPC_MIN_INTERVAL_MS = Number(process.env.BONDING_CURVE_RPC_MIN_INTERVAL_MS) || 300;
 
-// Concentration des détenteurs (2026-08-21, voir sql/schema.sql) : capturée
-// UNE SEULE FOIS par token, sur le snapshot dont le délai correspond à
-// cette valeur — pas à chaque snapshot, ~20 appels RPC par lecture (voir
-// src/holders.js) sur un listener qui suit TOUS les tokens créés (pas le
-// sous-ensemble filtré de scripts/watch-axiom-candidates.js), donc un
-// point dans le temps plutôt qu'une trajectoire complète pour rester
-// raisonnable envers le quota RPC. Doit correspondre à une valeur présente
-// dans BONDING_CURVE_SNAPSHOT_DELAYS_MS, sinon elle n'est jamais capturée.
-const HOLDERS_SNAPSHOT_DELAY_MS = Number(process.env.HOLDERS_SNAPSHOT_DELAY_MS) || 30000;
+// Rétention à deux niveaux (voir sql/schema.sql) : token_snapshots purgée
+// après SNAPSHOT_RETENTION_MS, raw_new_token_event/raw_migration_event mis
+// à NULL après RAW_JSON_RETENTION_MS — le reste de la ligne tokens (résumé,
+// groupe A/B/C, métriques dérivées bc_*) n'est jamais purgé.
+const SNAPSHOT_RETENTION_MS = Number(process.env.SNAPSHOT_RETENTION_MS) || 4 * 24 * 3600 * 1000;
+const RAW_JSON_RETENTION_MS = Number(process.env.RAW_JSON_RETENTION_MS) || 7 * 24 * 3600 * 1000;
+// Purge par petits lots à chaque cycle plutôt qu'en une fois — une
+// suppression/mise à jour trop large dépasse le statement timeout Supabase
+// ou la longueur d'URL PostgREST (repéré le 2026-08-23, voir le
+// git log de scripts/reset-database.js avant son retrait). PURGE_MAX_BATCHES
+// borne le temps passé sur la purge à chaque cycle ; les cycles suivants
+// rattrapent le reste.
+const PURGE_BATCH_SIZE = 150;
+const PURGE_MAX_BATCHES = Number(process.env.PURGE_MAX_BATCHES) || 20;
 
 // --------------------------------------------------------------------
 // Classification / extraction — pures, testables sans réseau ni Supabase.
@@ -153,11 +203,95 @@ function createDb(supabaseClient) {
       const { error } = await supabaseClient.from('token_snapshots').insert(row);
       if (error) throw new Error(`insertSnapshot: ${error.message}`);
     },
+    // Recopie EN DIRECT les métriques dérivées de la cascade sur tokens
+    // (voir sql/schema.sql) — pas un batch après coup. Lecture-modification-
+    // écriture plutôt qu'une expression SQL atomique (GREATEST/COALESCE via
+    // une fonction Postgres) : plus simple, et sans risque de course ici
+    // puisque les lectures d'un même token sont sérialisées (setTimeout
+    // croissants sur la même file RPC), jamais concurrentes entre elles.
+    async updateTokenDerivedMetrics(mint, { ratio, ageSeconds, checkpointColumn }) {
+      const { data: current, error: selectError } = await supabaseClient
+        .from('tokens')
+        .select('bc_peak_ratio, bc_first_active_at_s, bc_cascade_reads')
+        .eq('mint', mint)
+        .maybeSingle();
+      if (selectError) throw new Error(`updateTokenDerivedMetrics(select): ${selectError.message}`);
+
+      const update = { bc_cascade_reads: (current?.bc_cascade_reads ?? 0) + 1 };
+      if (checkpointColumn && ratio !== null && ratio !== undefined) update[checkpointColumn] = ratio;
+      if (ratio !== null && ratio !== undefined) {
+        const currentPeak = current?.bc_peak_ratio;
+        update.bc_peak_ratio =
+          currentPeak === null || currentPeak === undefined || Math.abs(ratio - 1) > Math.abs(currentPeak - 1) ? ratio : currentPeak;
+        const relDev = Math.abs(ratio - 1);
+        if (relDev > ACTIVITY_REL_DEV_THRESHOLD && (current?.bc_first_active_at_s === null || current?.bc_first_active_at_s === undefined)) {
+          update.bc_first_active_at_s = ageSeconds;
+        }
+      }
+      const { error } = await supabaseClient.from('tokens').update(update).eq('mint', mint);
+      if (error) throw new Error(`updateTokenDerivedMetrics(update): ${error.message}`);
+    },
+    // Supprime jusqu'à PURGE_MAX_BATCHES lots de token_snapshots plus
+    // vieux que windowMs. Ne boucle PAS jusqu'à épuisement — un cycle de
+    // nettoyage reste rapide, le rattrapage se fait sur les cycles
+    // suivants (voir CLEANUP_INTERVAL_MS dans main()).
+    async purgeOldSnapshots(windowMs) {
+      const cutoff = new Date(Date.now() - windowMs).toISOString();
+      let totalDeleted = 0;
+      for (let batch = 0; batch < PURGE_MAX_BATCHES; batch += 1) {
+        const { data: rows, error: selectError } = await supabaseClient
+          .from('token_snapshots')
+          .select('id')
+          .lt('captured_at', cutoff)
+          .limit(PURGE_BATCH_SIZE);
+        if (selectError) throw new Error(`purgeOldSnapshots(select): ${selectError.message}`);
+        if (!rows.length) break;
+        const { error: deleteError, count } = await supabaseClient
+          .from('token_snapshots')
+          .delete({ count: 'exact' })
+          .in(
+            'id',
+            rows.map((r) => r.id)
+          );
+        if (deleteError) throw new Error(`purgeOldSnapshots(delete): ${deleteError.message}`);
+        totalDeleted += count ?? 0;
+        if (rows.length < PURGE_BATCH_SIZE) break;
+      }
+      return totalDeleted;
+    },
+    // NULLise raw_new_token_event/raw_migration_event des tokens créés il y
+    // a plus de windowMs — garde tout le reste de la ligne (résumé, groupe,
+    // métriques bc_*) indéfiniment. Même logique de lots que ci-dessus.
+    async purgeOldRawJson(windowMs) {
+      const cutoff = new Date(Date.now() - windowMs).toISOString();
+      let totalUpdated = 0;
+      for (let batch = 0; batch < PURGE_MAX_BATCHES; batch += 1) {
+        const { data: rows, error: selectError } = await supabaseClient
+          .from('tokens')
+          .select('mint')
+          .lt('created_at', cutoff)
+          .not('raw_new_token_event', 'is', null)
+          .limit(PURGE_BATCH_SIZE);
+        if (selectError) throw new Error(`purgeOldRawJson(select): ${selectError.message}`);
+        if (!rows.length) break;
+        const { error: updateError, count } = await supabaseClient
+          .from('tokens')
+          .update({ raw_new_token_event: null, raw_migration_event: null }, { count: 'exact' })
+          .in(
+            'mint',
+            rows.map((r) => r.mint)
+          );
+        if (updateError) throw new Error(`purgeOldRawJson(update): ${updateError.message}`);
+        totalUpdated += count ?? 0;
+        if (rows.length < PURGE_BATCH_SIZE) break;
+      }
+      return totalUpdated;
+    },
     // Ferme la fenêtre d'observation des tokens non migrés créés il y a
-    // plus de OBSERVATION_WINDOW_MS. Ne touche PAS aux lignes tokens
-    // elles-mêmes (le résumé est gardé pour tous, migrés ou non — voir
-    // README). La purge de token_snapshots est un TODO pour l'option B :
-    // en V1 cette table reste vide, rien à purger.
+    // plus de OBSERVATION_WINDOW_MS. Ne touche PAS au résumé lui-même
+    // (gardé pour tous, migrés ou non — voir README) ni au JSON brut : ce
+    // sont purgeOldSnapshots/purgeOldRawJson ci-dessus qui s'en chargent,
+    // séparément et sur une fenêtre différente (voir sql/schema.sql).
     async closeExpiredWindows(windowMs) {
       const cutoff = new Date(Date.now() - windowMs).toISOString();
       const { error, count } = await supabaseClient
@@ -206,10 +340,10 @@ class EventBuffer {
 }
 
 // --------------------------------------------------------------------
-// Snapshots de bonding curve — trajectoire à délais fixes après création
-// (voir en-tête du fichier). Pas de polling continu : une poignée de
-// lectures ponctuelles par token, sérialisées via une file d'attente pour
-// rester raisonnable envers le RPC public gratuit.
+// Cascade de bonding curve — gate d'activité à deux niveaux (voir en-tête
+// du fichier). Pas de polling continu : une poignée de lectures
+// ponctuelles par token, sérialisées via une file d'attente pour rester
+// raisonnable envers le RPC public gratuit.
 // --------------------------------------------------------------------
 
 // File qui espace les appels RPC d'au moins minIntervalMs, tous appelants
@@ -224,14 +358,29 @@ function createRpcThrottle(minIntervalMs) {
   };
 }
 
-// holdersFetchFn injectable séparément de fetchFn (test/integration.js n'a
-// pas besoin de fausser les deux de la même façon — la bonding curve et les
-// holders touchent des méthodes RPC différentes).
-async function captureBondingCurveSnapshot(
+// Colonnes dérivées "point de contrôle" (voir sql/schema.sql) — seuls ces
+// 4 délais nominaux ont une colonne dédiée sur tokens ; les autres points
+// de la cascade (2s, 45s, 60s, longue traîne) servent à la décision
+// active/inactif et au peak/first-active, pas à un checkpoint individuel.
+const CHECKPOINT_COLUMNS = { 5: 'bc_ratio_t5s', 10: 'bc_ratio_t10s', 20: 'bc_ratio_t20s', 30: 'bc_ratio_t30s' };
+
+function computeRelDev(observed, initial) {
+  if (!initial) return null;
+  return Math.abs(observed - initial) / initial;
+}
+
+// Une lecture de cascade : bonding curve (+ holders si demandé), écrit le
+// snapshot brut et met à jour les métriques dérivées sur tokens dans la
+// foulée. Retourne {relDev, complete, virtualSolReserves} pour que
+// l'appelant décide de la suite (actif ? migré/vidé ?), ou null en cas
+// d'échec RPC — un échec n'interrompt pas la cascade, juste ce point-là.
+async function captureCascadeRead(
   db,
   rpcThrottle,
   mint,
   createdAtMs,
+  initialVSol,
+  nominalDelayS,
   { captureHolders = false, fetchFn = fetchBondingCurveState, holdersFetchFn = fetchHolderConcentration } = {}
 ) {
   const ageSeconds = Math.round((Date.now() - createdAtMs) / 1000);
@@ -240,6 +389,7 @@ async function captureBondingCurveSnapshot(
     const row = {
       mint,
       age_seconds: ageSeconds,
+      nominal_delay_s: nominalDelayS,
       virtual_sol_reserves: state.virtual_quote_reserves_sol,
       virtual_token_reserves: state.virtual_token_reserves,
       raw_event: state,
@@ -258,32 +408,128 @@ async function captureBondingCurveSnapshot(
       }
     }
     await db.insertSnapshot(row);
+
+    const ratio = initialVSol ? state.virtual_quote_reserves_sol / initialVSol : null;
+    await db.updateTokenDerivedMetrics(mint, { ratio, ageSeconds, checkpointColumn: CHECKPOINT_COLUMNS[nominalDelayS] });
+
+    return { relDev: computeRelDev(state.virtual_quote_reserves_sol, initialVSol), complete: state.complete, virtualSolReserves: state.virtual_quote_reserves_sol };
   } catch (err) {
-    await db.logIngestion('bonding_curve_snapshot_error', `${mint} @${ageSeconds}s: ${err.message}`).catch(() => {});
+    await db.logIngestion('bonding_curve_snapshot_error', `${mint} @${ageSeconds}s (T+${nominalDelayS}s): ${err.message}`).catch(() => {});
+    return null;
   }
 }
 
-// Programme les lectures pour un token qui vient d'être créé. isShuttingDown
-// est une fonction (pas une valeur) car on veut lire l'état AU MOMENT où le
-// timer se déclenche, pas au moment où il est programmé — un run peut
-// commencer son arrêt entre les deux (voir main()). On laisse alors ce
-// snapshot de côté plutôt que de risquer une écriture pendant le relais.
-function scheduleBondingCurveSnapshots(
+// Orchestre la cascade complète pour un token qui vient d'être créé : gate
+// universel -> étendue si actif -> longue traîne si toujours actif (voir
+// en-tête du fichier). Retourne {stop} pour permettre un arrêt immédiat
+// depuis l'extérieur (migration détectée en temps réel, voir main()) sans
+// attendre le prochain point programmé. isShuttingDown est une fonction
+// (pas une valeur) car on veut lire l'état AU MOMENT où le timer se
+// déclenche, pas au moment où il est programmé — un run peut commencer son
+// arrêt entre les deux.
+function scheduleTokenCascade(
   db,
   rpcThrottle,
   mint,
   createdAtMs,
+  initialVSol,
   isShuttingDown,
-  delaysMs = BONDING_CURVE_SNAPSHOT_DELAYS_MS,
-  holdersDelayMs = HOLDERS_SNAPSHOT_DELAY_MS
+  {
+    gateDelaysS = GATE_DELAYS_S,
+    extendedDelaysS = EXTENDED_DELAYS_S,
+    longTailDelaysS = LONG_TAIL_DELAYS_S,
+    onDone = () => {},
+    fetchFn = fetchBondingCurveState,
+    holdersFetchFn = fetchHolderConcentration,
+  } = {}
 ) {
-  return delaysMs.map((delayMs) => {
-    const remaining = Math.max(delayMs - (Date.now() - createdAtMs), 0);
-    return setTimeout(() => {
-      if (isShuttingDown()) return;
-      captureBondingCurveSnapshot(db, rpcThrottle, mint, createdAtMs, { captureHolders: delayMs === holdersDelayMs }).catch(() => {});
-    }, remaining);
-  });
+  const timers = [];
+  let stopped = false;
+  let done = false;
+
+  // Appelé exactement une fois, dès qu'on SAIT qu'aucune autre lecture ne
+  // sera programmée pour ce token (arrêt externe, résolu, jugé inactif à
+  // une étape, ou dernier point de la longue traîne atteint) — permet à
+  // main() de retirer l'entrée de activeCascades plutôt que de la laisser
+  // traîner en mémoire jusqu'à la fin du run.
+  function markDone() {
+    if (done) return;
+    done = true;
+    onDone(mint);
+  }
+
+  function stop() {
+    stopped = true;
+    for (const t of timers) clearTimeout(t);
+    timers.length = 0;
+    markDone();
+  }
+
+  function scheduleAt(delayS, fn) {
+    const remaining = Math.max(delayS * 1000 - (Date.now() - createdAtMs), 0);
+    timers.push(setTimeout(fn, remaining));
+  }
+
+  // "Résolu" = déjà migré/vidé (complete=true ou réserve à 0) : plus rien
+  // à apprendre de ce token, on arrête tout de suite plutôt que de gaspiller
+  // les points restants de la cascade en cours.
+  function isResolved(result) {
+    return !!result && (result.complete || result.virtualSolReserves === 0);
+  }
+
+  async function runRead(delayS, opts) {
+    if (stopped || isShuttingDown()) return null;
+    const result = await captureCascadeRead(db, rpcThrottle, mint, createdAtMs, initialVSol, delayS, { fetchFn, holdersFetchFn, ...opts });
+    if (isResolved(result)) stop();
+    return result;
+  }
+
+  function isActive(results) {
+    return results.some((r) => r && r.relDev !== null && r.relDev > ACTIVITY_REL_DEV_THRESHOLD);
+  }
+
+  function scheduleLongTail() {
+    let longTailDone = 0;
+    for (const delayS of longTailDelaysS) {
+      scheduleAt(delayS, async () => {
+        await runRead(delayS).catch(() => {});
+        longTailDone += 1;
+        if (longTailDone === longTailDelaysS.length) markDone();
+      });
+    }
+  }
+
+  function scheduleExtended() {
+    const results = [];
+    let extendedDone = 0;
+    for (const delayS of extendedDelaysS) {
+      scheduleAt(delayS, async () => {
+        const result = await runRead(delayS, { captureHolders: delayS === extendedDelaysS[0] }).catch(() => null);
+        results.push(result);
+        extendedDone += 1;
+        if (extendedDone === extendedDelaysS.length && !stopped) {
+          if (isActive(results)) scheduleLongTail();
+          else markDone();
+        }
+      });
+    }
+  }
+
+  const gateResults = [];
+  let gateDone = 0;
+  for (const delayS of gateDelaysS) {
+    scheduleAt(delayS, async () => {
+      const result = await runRead(delayS).catch(() => null);
+      gateResults.push(result);
+      gateDone += 1;
+      if (gateDone === gateDelaysS.length && !stopped) {
+        if (isActive(gateResults)) scheduleExtended();
+        else markDone();
+      }
+    });
+  }
+
+  return { stop };
 }
 
 // --------------------------------------------------------------------
@@ -328,6 +574,10 @@ async function main() {
   const db = createDb(createClient(supabaseUrl, supabaseKey, { auth: { persistSession: false } }));
   const buffer = new EventBuffer(db);
   const rpcThrottle = createRpcThrottle(BONDING_CURVE_RPC_MIN_INTERVAL_MS);
+  // mint -> {stop} des cascades en cours, pour pouvoir arrêter net dès
+  // qu'une migration arrive (voir le handler 'migration' ci-dessous) sans
+  // attendre le prochain point programmé.
+  const activeCascades = new Map();
 
   let ws = null;
   let lastMessageAt = Date.now();
@@ -360,9 +610,26 @@ async function main() {
       if (type === 'new_token') {
         const row = buildTokenRow(msg, nowIso);
         buffer.addNewToken(row);
-        scheduleBondingCurveSnapshots(db, rpcThrottle, row.mint, Date.parse(row.created_at), () => shuttingDown);
+        const cascade = scheduleTokenCascade(
+          db,
+          rpcThrottle,
+          row.mint,
+          Date.parse(row.created_at),
+          row.initial_virtual_sol_reserves,
+          () => shuttingDown,
+          { onDone: (doneMint) => activeCascades.delete(doneMint) }
+        );
+        activeCascades.set(row.mint, cascade);
       } else if (type === 'migration') {
-        buffer.addMigration(buildMigrationRow(msg, nowIso));
+        const migRow = buildMigrationRow(msg, nowIso);
+        buffer.addMigration(migRow);
+        // Arrêt immédiat de la cascade en cours pour ce mint (voir en-tête
+        // du fichier) : la migration est le signal le plus fiable qu'il
+        // n'y a plus rien à apprendre de la bonding curve, pas la peine
+        // d'attendre le prochain point programmé pour s'en rendre compte.
+        // stop() déclenche onDone, qui retire l'entrée de activeCascades —
+        // pas besoin de le refaire ici.
+        activeCascades.get(migRow.mint)?.stop();
       } else {
         // Probablement un accusé de souscription ou un format inattendu —
         // loggé pour inspection plutôt que silencieusement perdu.
@@ -412,6 +679,22 @@ async function main() {
   );
 
   timers.push(
+    setInterval(() => {
+      db.purgeOldSnapshots(SNAPSHOT_RETENTION_MS)
+        .then((count) => db.logIngestion('snapshots_purged', `${count} snapshot(s) purgé(s) (fenêtre ${Math.round(SNAPSHOT_RETENTION_MS / 86_400_000)}j)`))
+        .catch((err) => console.error(`purge snapshots échouée: ${err.message}`));
+    }, CLEANUP_INTERVAL_MS)
+  );
+
+  timers.push(
+    setInterval(() => {
+      db.purgeOldRawJson(RAW_JSON_RETENTION_MS)
+        .then((count) => db.logIngestion('raw_json_purged', `${count} token(s) JSON brut nullisé (fenêtre ${Math.round(RAW_JSON_RETENTION_MS / 86_400_000)}j)`))
+        .catch((err) => console.error(`purge JSON brut échouée: ${err.message}`));
+    }, CLEANUP_INTERVAL_MS)
+  );
+
+  timers.push(
     setInterval(async () => {
       if (Date.now() - startTime < MAX_RUNTIME_MS) return;
       shuttingDown = true;
@@ -454,8 +737,9 @@ module.exports = {
   EventBuffer,
   triggerNextRun,
   createRpcThrottle,
-  captureBondingCurveSnapshot,
-  scheduleBondingCurveSnapshots,
+  computeRelDev,
+  captureCascadeRead,
+  scheduleTokenCascade,
   main,
 };
 

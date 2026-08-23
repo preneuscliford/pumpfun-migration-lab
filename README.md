@@ -9,34 +9,74 @@ la création permettent de le prédire statistiquement.
 Aucun ordre n'est jamais envoyé. Ce projet ne fait que lire un flux public
 et écrire dans une base de données.
 
-## Portée V1
+## Portée
 
 - `subscribeNewToken` + `subscribeMigration` uniquement — **pas** de
-  `subscribeTokenTrade`, pas de polling de prix en cours de fenêtre.
+  `subscribeTokenTrade`, pas de polling de prix en continu.
 - Pour chaque token créé, une fenêtre d'observation de 6h : s'il migre
-  dans cette fenêtre, on garde tout ; sinon, on ferme la fenêtre et on
-  purge le détail (voir "Deux niveaux de conservation" plus bas).
-- Question posée par cette V1 : **les caractéristiques statiques
-  disponibles à la création (créateur, réserves initiales de la bonding
-  curve, présence de métadonnées, forme du nom/symbole...) suffisent-elles
-  déjà à distinguer les tokens qui migrent des autres ?** Si oui, on aura
-  une raison d'ajouter une couche dynamique (option B, plus coûteuse) :
-  quelques snapshots périodiques pendant la fenêtre. Si non, pas la peine
-  de payer ce coût-là pour rien.
+  dans cette fenêtre, on garde tout ; sinon, on ferme la fenêtre.
+- Question V1 (répondue) : les caractéristiques statiques disponibles à
+  la création (créateur, réserves initiales, métadonnées...) ne
+  suffisaient pas seules à distinguer les tokens qui migrent — d'où la
+  couche dynamique V2 ci-dessous.
+- Question V2 (en cours) : **à T+5s, T+10s, T+20s ou T+30s, quelles
+  caractéristiques de la trajectoire de la bonding curve distinguent déjà
+  une migration progressive (groupe B) d'un token qui ne migrera pas
+  (groupe C) ?**
+
+## V2 — surveillance en cascade à gate d'activité
+
+Les 4 snapshots fixes de la V1 (30s/60s/180s/300s) arrivaient trop tard :
+la médiane de migration du groupe B est ~64s, et beaucoup de comptes
+étaient déjà à 0/0 au premier snapshot. La V2 (2026-08-23) observe la
+trajectoire beaucoup plus tôt, sans suivre tous les tokens à haute
+fréquence par défaut :
+
+1. **Gate universel** (tous les tokens) : lectures à T+2s / T+5s / T+10s.
+2. Si au moins une de ces lectures dépasse le seuil de bruit calibré sur
+   des données réelles (écart relatif > `1e-4` vs
+   `initial_virtual_sol_reserves` — voir
+   `scripts/calibrate-activity-threshold.js` ; le bruit flottant pur
+   reste sous `1e-8`, la masse réelle démarre autour de `1e-4`) : cascade
+   **étendue** T+20s / 30s / 45s / 60s.
+3. Toujours actif à la fin de la cascade étendue : **longue traîne**
+   espacée T+2min / 5min / 10min / 20min / 30min, arrêtée immédiatement
+   dès qu'une migration est détectée en temps réel (`subscribeMigration`)
+   ou qu'une lecture montre `complete=true` / réserve à 0.
+
+Les **holders** (`src/holders.js`, ~20 appels RPC, lent — voir "Ce qui
+n'est pas vérifié" plus bas) suivent le même gate : capturés une seule
+fois, au premier point de la cascade étendue (T+20s) — donc seulement
+pour les tokens jugés actifs, jamais inconditionnellement.
+
+Tous les délais (`GATE_DELAYS_S`, `EXTENDED_DELAYS_S`,
+`LONG_TAIL_DELAYS_S`) et le seuil (`ACTIVITY_REL_DEV_THRESHOLD`) sont
+surchargeables par variable d'environnement — voir `src/listener.js`.
 
 ## Deux niveaux de conservation
 
 Supprimer entièrement les tokens qui ne migrent pas détruirait le groupe
 témoin nécessaire à la comparaison statistique. On garde donc :
 
-- un **résumé** (table `tokens`) — pour **tous** les tokens, migrés ou
-  non : créateur, état initial de la bonding curve, résultat migré/non
-  migré, délai de migration (calculé par Postgres, pas par l'application —
-  voir `sql/schema.sql`), et le JSON brut des deux événements.
-- un **détail** (table `token_snapshots`) — prévue pour l'option B
-  (snapshots périodiques), **vide en V1** puisqu'on ne collecte pas encore
-  cette couche. Ne pas s'inquiéter qu'elle soit vide au début : c'est le
-  scope V1, pas un bug de collecte.
+- un **dataset permanent léger** (table `tokens`, jamais purgé) — pour
+  **tous** les tokens, migrés ou non : créateur, état initial de la
+  bonding curve, résultat migré/non migré, délai de migration (calculé
+  par Postgres, pas par l'application — voir `sql/schema.sql`), et les
+  métriques dérivées de la cascade (`bc_ratio_t5s/t10s/t20s/t30s`,
+  `bc_first_active_at_s`, `bc_peak_ratio`, `bc_cascade_reads`), écrites
+  **en direct** au fil de la cascade — jamais recalculées après coup à
+  partir des snapshots bruts.
+- un **détail temporaire** (table `token_snapshots`) — la trajectoire
+  brute complète de la bonding curve, en fenêtre glissante
+  (`SNAPSHOT_RETENTION_MS`, ~4 jours par défaut). Purgée par lots
+  périodiques par le listener lui-même (`purgeOldSnapshots`) — ce n'est
+  qu'un filet de sécurité temporaire, les métriques utiles ont déjà été
+  recopiées sur `tokens.bc_*`.
+- le **JSON brut** des deux événements (`raw_new_token_event` /
+  `raw_migration_event`) est mis à `NULL` après `RAW_JSON_RETENTION_MS`
+  (~7 jours par défaut, `purgeOldRawJson`) — fenêtre plus longue que les
+  snapshots car il sert de rattrapage si un champ non prévu s'avère utile
+  après coup, mais n'est pas gardé indéfiniment non plus.
 
 ```
                      TOUS LES TOKENS
@@ -45,20 +85,22 @@ témoin nécessaire à la comparaison statistique. On garde donc :
              ↓                           ↓
         NON MIGRÉS                    MIGRÉS
              │                           │
-       résumé conservé            résumé conservé
-       snapshots supprimés        snapshots conservés
-                                  (à partir de l'option B)
+   résumé + bc_* conservés      résumé + bc_* conservés
+   (pour toujours)              (pour toujours)
+   snapshots bruts purgés       snapshots bruts purgés
+   après ~4j, JSON brut         après ~4j, JSON brut
+   après ~7j                    après ~7j
 ```
-
-Le JSON brut (`raw_new_token_event`/`raw_migration_event`) est toujours
-conservé : assurance contre un champ qu'on n'aurait pas pensé à extraire
-au moment d'écrire le parseur — on pourra toujours revenir le chercher
-plus tard sans avoir eu besoin de le prévoir à l'avance.
 
 ## Mise en place
 
 1. **Supabase** : créer un projet gratuit sur supabase.com, puis coller le
-   contenu de `sql/schema.sql` dans leur éditeur SQL et l'exécuter.
+   contenu de `sql/schema.sql` dans leur éditeur SQL et l'exécuter. Sur un
+   projet déjà créé avant la V2 (tables `tokens`/`token_snapshots`
+   existantes), le bloc `create table if not exists` ne touche pas aux
+   tables déjà là : exécuter en plus la section "Migration V2" en bas du
+   fichier (`alter table ... add column if not exists ...`, sûre à
+   réexécuter).
 2. **Secrets du repo** (Settings → Secrets and variables → Actions) :
    - `SUPABASE_URL` — l'URL du projet (`https://xxxx.supabase.co`)
    - `SUPABASE_SERVICE_KEY` — la clé **service_role** (pas la clé
@@ -126,8 +168,10 @@ Fait tourner `src/listener.js` comme un vrai process contre un faux
 serveur WebSocket et un faux serveur HTTP, tous deux locaux — aucun appel
 vers pumpportal.fun ou supabase.co. Vérifie la connexion, l'abonnement,
 la classification (y compris un événement inconnu), le buffering/flush,
-la reconnexion après coupure, et le déclenchement du relais de fin de
-run.
+la reconnexion après coupure, le déclenchement du relais de fin de run,
+et la cascade V2 (gate + étendue + holders une seule fois, via des délais
+raccourcis passés par variables d'environnement — voir le haut du
+fichier).
 
 ## Explicitement hors scope pour l'instant
 
