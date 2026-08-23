@@ -307,19 +307,21 @@ function createDb(supabaseClient) {
 }
 
 // --------------------------------------------------------------------
-// Buffer d'événements — regroupe les écritures pour rester économe en
-// requêtes plutôt qu'un insert par événement.
+// Buffer d'événements de migration — regroupe les écritures pour rester
+// économe en requêtes plutôt qu'un update par événement. Les créations ne
+// passent PAS par ce buffer (voir main()) : la cascade V2 lit la bonding
+// curve dès T+2s, largement avant qu'un flush périodique (FLUSH_INTERVAL_MS,
+// ~10s) n'ait eu lieu — les bufferiser provoquait une violation de
+// contrainte de clé étrangère sur token_snapshots (le token n'existait pas
+// encore côté Supabase à la première lecture de la cascade, bug constaté en
+// prod le 2026-08-23 juste après le déploiement V2). Les migrations n'ont
+// pas cette dépendance en aval, donc rester bufferisées reste sûr.
 // --------------------------------------------------------------------
 
 class EventBuffer {
   constructor(db) {
     this.db = db;
-    this.newTokenRows = [];
     this.migrationRows = [];
-  }
-
-  addNewToken(row) {
-    this.newTokenRows.push(row);
   }
 
   addMigration(row) {
@@ -327,15 +329,13 @@ class EventBuffer {
   }
 
   get size() {
-    return this.newTokenRows.length + this.migrationRows.length;
+    return this.migrationRows.length;
   }
 
   async flush() {
-    const tokens = this.newTokenRows.splice(0, this.newTokenRows.length);
     const migrations = this.migrationRows.splice(0, this.migrationRows.length);
-    if (tokens.length) await this.db.upsertNewTokens(tokens);
     if (migrations.length) await this.db.upsertMigrations(migrations);
-    return { tokens: tokens.length, migrations: migrations.length };
+    return { migrations: migrations.length };
   }
 }
 
@@ -609,17 +609,41 @@ async function main() {
       const type = classifyEvent(msg);
       if (type === 'new_token') {
         const row = buildTokenRow(msg, nowIso);
-        buffer.addNewToken(row);
-        const cascade = scheduleTokenCascade(
-          db,
-          rpcThrottle,
-          row.mint,
-          Date.parse(row.created_at),
-          row.initial_virtual_sol_reserves,
-          () => shuttingDown,
-          { onDone: (doneMint) => activeCascades.delete(doneMint) }
-        );
-        activeCascades.set(row.mint, cascade);
+        // Upsert immédiat, PAS de mise en buffer (voir EventBuffer) : la
+        // cascade ne doit être programmée qu'une fois le token réellement
+        // écrit côté Supabase, sinon sa première lecture (T+2s) viole la
+        // clé étrangère token_snapshots -> tokens. Un upsert par création
+        // reste largement dans le budget de requêtes Supabase Free vu le
+        // débit (~1 création/3s).
+        //
+        // L'upsert étant maintenant async, un événement 'migration' pour ce
+        // mint peut arriver AVANT que la cascade ne soit programmée (donc
+        // avant qu'elle existe dans activeCascades) — un placeholder
+        // synchrone absorbe un stop() prématuré via son propre flag, sur le
+        // même principe que le "stopped" interne de scheduleTokenCascade.
+        let stoppedBeforeScheduled = false;
+        activeCascades.set(row.mint, { stop: () => { stoppedBeforeScheduled = true; } });
+        db.upsertNewTokens([row])
+          .then(() => {
+            if (stoppedBeforeScheduled) {
+              activeCascades.delete(row.mint);
+              return;
+            }
+            const cascade = scheduleTokenCascade(
+              db,
+              rpcThrottle,
+              row.mint,
+              Date.parse(row.created_at),
+              row.initial_virtual_sol_reserves,
+              () => shuttingDown,
+              { onDone: (doneMint) => activeCascades.delete(doneMint) }
+            );
+            activeCascades.set(row.mint, cascade);
+          })
+          .catch((err) => {
+            activeCascades.delete(row.mint);
+            db.logIngestion('bonding_curve_snapshot_error', `upsert immédiat échoué pour ${row.mint}, cascade non programmée: ${err.message}`).catch(() => {});
+          });
       } else if (type === 'migration') {
         const migRow = buildMigrationRow(msg, nowIso);
         buffer.addMigration(migRow);
