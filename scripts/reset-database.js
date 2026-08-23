@@ -38,8 +38,10 @@ async function countRows(supabase, table) {
 // colonnes jsonb volumineuses (raw_new_token_event) dépasse le statement
 // timeout de Supabase (repéré le 2026-08-23, table tokens). On sélectionne
 // un lot de clés, on les supprime, on répète jusqu'à ce qu'il n'en reste
-// plus — chaque requête individuelle reste petite.
-const BATCH_SIZE = 2000;
+// plus. Lot de 150 : un lot de 2000 fait dépasser la longueur d'URL
+// acceptée par PostgREST pour le filtre .in() (même limite déjà repérée
+// dans src/report.js pour la requête token_snapshots du groupe B).
+const BATCH_SIZE = 150;
 
 async function deleteAllRows(supabase, table, keyColumn) {
   let totalDeleted = 0;
