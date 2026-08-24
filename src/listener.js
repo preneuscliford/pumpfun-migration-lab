@@ -496,6 +496,13 @@ function createAdaptiveBondingCurveThrottle() {
   let lastRefillAt = Date.now();
   const pending = [];
   let pumpTimer = null;
+  // Dernière fois qu'une lecture est passée par le chemin FORCÉ (garde-
+  // fou de délai) — sert uniquement à espacer deux passages forcés
+  // consécutifs d'au moins intervalMs (voir pump(), 2e correctif du
+  // 2026-08-25). 0 = jamais encore forcé, donc "il y a très longtemps" en
+  // temps réel : le tout premier passage forcé n'a rien à espacer par
+  // rapport à.
+  let lastForcedDispatchAt = 0;
 
   function refill() {
     const now = Date.now();
@@ -545,30 +552,57 @@ function createAdaptiveBondingCurveThrottle() {
       dispatch(item, false);
     }
     // 2) Garde-fou de délai : AU PLUS UNE lecture forcée par appel de
-    //    pump(), jamais toute la file en une fois. Post-mortem du
-    //    2026-08-25 : sans cette limite, un engorgement fait passer
-    //    d'un coup toutes les lectures en retard dès qu'elles atteignent
-    //    le seuil, créant une vraie rafale simultanée vers le RPC — donc
-    //    de la contention réelle, qui redéclenche noteRateLimited() et
-    //    entretient l'engorgement au lieu de le résorber. schedulePump()
-    //    ci-dessous re-réveille pump() pour la suivante, espacée d'au
-    //    moins BC_MIN_INTERVAL_MS.
+    //    pump(), jamais toute la file en une fois — ET jamais plus vite
+    //    que le rythme COURANT de l'adaptatif (intervalMs) depuis la
+    //    dernière lecture forcée. Deux correctifs cumulés du 2026-08-25,
+    //    tous deux découverts en mesurant en production
+    //    (scripts/analyze-adaptive-throttle.js) :
+    //    1er (8d5c872) : sans la limite "une seule par appel", un
+    //       engorgement faisait passer TOUTE la file en retard d'un coup
+    //       dès qu'elle atteignait le seuil — rafale simultanée vers le
+    //       RPC, contention réelle, re-déclenchement de noteRateLimited().
+    //    2e (celui-ci) : même après le 1er correctif, le pacage entre
+    //       lectures forcées consécutives utilisait BC_MIN_INTERVAL_MS
+    //       (80ms en prod) comme plancher — dès qu'une bonne part de la
+    //       file passait par le garde-fou (observé : 82,7% après 8min,
+    //       95,55% après 1h, donc en aggravation), le débit RÉEL vers le
+    //       RPC se calait sur ce plancher (~12,5 req/s), largement
+    //       au-dessus du rythme fixe de 300ms déjà validé sans échec, et
+    //       bien plus vite que ce que l'adaptatif jugeait prudent à cet
+    //       instant (jusqu'à BC_MAX_INTERVAL_MS=3000ms après
+    //       ralentissement). Le garde-fou devenait de facto le chemin
+    //       PRINCIPAL, plus une exception. La détection "délai dépassé"
+    //       (pastDeadline, en temps réel) reste séparée du pacage du
+    //       rythme d'émission (pacingOk, contre lastForcedDispatchAt) :
+    //       une lecture n'est forcée QUE si les deux sont vrais.
+    //       Conséquence assumée : sous surcharge réelle et soutenue,
+    //       l'attente peut dépasser BC_DEADLINE_MS pour certaines
+    //       lectures — préférable à re-déclencher la surcharge en
+    //       essayant de tenir un délai que le rythme sûr actuel ne
+    //       permet pas.
     if (pending.length) {
+      const now = Date.now();
       const item = pending[0];
-      if (Date.now() - item.queuedAtMs >= BC_DEADLINE_MS) {
+      const pastDeadline = now - item.queuedAtMs >= BC_DEADLINE_MS;
+      const pacingOk = now - lastForcedDispatchAt >= intervalMs;
+      if (pastDeadline && pacingOk) {
         pending.shift();
+        lastForcedDispatchAt = now;
         dispatch(item, true);
       }
     }
     if (pending.length) {
-      // Réveille au plus tôt entre "prochain jeton disponible" et
-      // "l'item le plus ancien atteint (ou a déjà dépassé) le garde-fou
-      // de délai" — plancher à BC_MIN_INTERVAL_MS pour ne jamais
-      // re-déclencher pump() en boucle serrée quand plusieurs lectures
-      // sont déjà toutes en retard.
-      const timeToNextToken = intervalMs - (Date.now() - lastRefillAt);
-      const timeToDeadline = Math.max(BC_MIN_INTERVAL_MS, BC_DEADLINE_MS - (Date.now() - pending[0].queuedAtMs));
-      schedulePump(Math.min(timeToNextToken, timeToDeadline));
+      // Réveille dès que : un jeton devient disponible, OU l'item le plus
+      // ancien a ET dépassé son garde-fou ET le pacage entre lectures
+      // forcées redevient permis (les deux conditions de la section
+      // ci-dessus) — jamais avant, jamais après.
+      const now = Date.now();
+      const item = pending[0];
+      const timeToNextToken = intervalMs - (now - lastRefillAt);
+      const timeToOwnDeadline = BC_DEADLINE_MS - (now - item.queuedAtMs);
+      const timeToPacingOk = intervalMs - (now - lastForcedDispatchAt);
+      const timeToForceable = Math.max(timeToOwnDeadline, timeToPacingOk);
+      schedulePump(Math.min(timeToNextToken, timeToForceable));
     }
   }
 
