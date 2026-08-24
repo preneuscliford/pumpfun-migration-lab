@@ -98,6 +98,25 @@ create table if not exists tokens (
   bc_peak_ratio numeric,
   bc_cascade_reads integer,
 
+  -- curve_completed_at_observed (2026-08-24) : posé par le listener à la
+  -- première lecture RPC (pas subscribeMigration) montrant complete=true
+  -- ou des réserves vidées — voir src/report.js, section CALIBRATION :
+  -- l'événement subscribeMigration s'est révélé arriver en retard de
+  -- plusieurs minutes (médiane ~414s, jusqu'à ~35min observés) sur l'état
+  -- réel on-chain, donc migrated_at seul ne suffit pas à savoir QUAND la
+  -- curve a réellement fini. Horloge séparée, jamais utilisée pour
+  -- remplacer migrated_at — curve_completion_lag_seconds ci-dessous
+  -- calcule l'écart entre les deux, positif quand le RPC voit la
+  -- complétion avant que PumpPortal ne la notifie. NULL = jamais observée
+  -- terminée dans les lectures retenues (ne veut PAS dire "n'a jamais
+  -- migré" : la cascade peut s'être arrêtée avant, voir listener.js).
+  curve_completed_at timestamptz,
+  curve_completion_lag_seconds integer generated always as (
+    case when migrated_at is not null and curve_completed_at is not null
+      then (extract(epoch from (migrated_at - curve_completed_at)))::int
+    end
+  ) stored,
+
   ingested_at timestamptz not null default now()
 );
 
@@ -139,7 +158,24 @@ create table if not exists token_snapshots (
   top_holders_count integer,
   top_holders_pct_of_supply numeric,
   holders_error text,
-  holders_raw jsonb
+  holders_raw jsonb,
+
+  -- Instrumentation de file RPC (2026-08-24) : découvert que des lectures
+  -- bonding curve visées à T+2/5/10s pouvaient être réellement exécutées
+  -- des HEURES plus tard (mesuré via captured_at, voir
+  -- scripts/measure-rpc-queue-delay.js) sans qu'on puisse dire si le temps
+  -- se perdait en file d'attente ou dans l'appel RPC lui-même (retries sur
+  -- 429 inclus — le RPC public renvoie 429 sur 100% des tentatives
+  -- holders observées ce jour-là). queue_wait_ms = temps entre l'entrée
+  -- dans la file RPC et le début de l'exécution ; rpc_call_ms = durée de
+  -- l'appel RPC lui-même. holders_queue_wait_ms/holders_rpc_call_ms
+  -- pareil, pour la capture holders (file séparée depuis ce même jour —
+  -- voir src/listener.js, createRpcThrottle). NULL sur les lignes
+  -- collectées avant cette date.
+  queue_wait_ms integer,
+  rpc_call_ms integer,
+  holders_queue_wait_ms integer,
+  holders_rpc_call_ms integer
 );
 
 create index if not exists idx_snapshots_mint_time on token_snapshots (mint, captured_at);
@@ -175,3 +211,19 @@ alter table tokens add column if not exists bc_cascade_reads integer;
 alter table token_snapshots add column if not exists nominal_delay_s integer;
 create index if not exists idx_tokens_raw_json_pending on tokens (created_at) where raw_new_token_event is not null;
 create index if not exists idx_snapshots_captured_at on token_snapshots (captured_at);
+
+-- Migration V2.1 (2026-08-24) — à exécuter une fois dans l'éditeur SQL
+-- Supabase, comme le bloc V2 ci-dessus. curve_completed_at_observed
+-- (horloge RPC, séparée de migrated_at/pumpportal) + instrumentation de
+-- file RPC (queue_wait_ms/rpc_call_ms) — voir les commentaires sur les
+-- colonnes plus haut dans ce fichier pour le contexte complet.
+alter table tokens add column if not exists curve_completed_at timestamptz;
+alter table tokens add column if not exists curve_completion_lag_seconds integer generated always as (
+  case when migrated_at is not null and curve_completed_at is not null
+    then (extract(epoch from (migrated_at - curve_completed_at)))::int
+  end
+) stored;
+alter table token_snapshots add column if not exists queue_wait_ms integer;
+alter table token_snapshots add column if not exists rpc_call_ms integer;
+alter table token_snapshots add column if not exists holders_queue_wait_ms integer;
+alter table token_snapshots add column if not exists holders_rpc_call_ms integer;

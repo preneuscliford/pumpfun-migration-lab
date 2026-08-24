@@ -299,7 +299,16 @@ async function main() {
   assert.strictEqual(holdersRow.curve_held_amount, 793100000000000, 'devrait identifier fakeCurveAta comme le compte de la curve');
   assert.strictEqual(holdersRow.top_holders_count, 1, 'devrait exclure fakeCurveAta et ne garder que le vrai holder');
   assert.ok(Math.abs(holdersRow.top_holders_pct_of_supply - 0.0005) < 1e-6, `top_holders_pct_of_supply inattendu: ${holdersRow.top_holders_pct_of_supply}`);
-  assert.strictEqual(snapshotRows.filter((r) => r.total_supply != null).length, 1, 'les holders ne doivent être capturés qu\'une seule fois par token');
+  // 2, pas 1 : ce scénario envoie délibérément un événement de création en
+  // double (à la reconnexion, voir plus haut) pour tester la reconnexion —
+  // depuis que subscribeMigration ne déclenche plus l'arrêt d'une cascade
+  // (2026-08-24, il s'est révélé en retard de plusieurs minutes sur l'état
+  // RPC réel), rien n'annule plus plus la première cascade quand la seconde
+  // démarre : les deux tournent indépendamment jusqu'à leur propre
+  // résolution RPC, donc les holders sont capturés une fois par cascade.
+  // Dans une création normale (non dupliquée), une seule cascade tourne et
+  // les holders ne sont toujours capturés qu'une fois.
+  assert.strictEqual(snapshotRows.filter((r) => r.total_supply != null).length, 2, 'les holders devraient être capturés une fois par cascade (2 cascades dans ce scénario de reconnexion)');
 
   // Métriques dérivées recopiées sur tokens en direct (updateTokenDerivedMetrics).
   const derivedUpdateCalls = httpRequests.filter(

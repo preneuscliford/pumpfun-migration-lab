@@ -20,11 +20,18 @@
 //      Sinon, arrêt — pas la peine de suivre un token qui n'a montré aucun
 //      mouvement dans les 10 premières secondes.
 //   3. Toujours actif à la fin de l'étendue ? -> longue traîne espacée
-//      LONG_TAIL_DELAYS_S. Arrêt immédiat, à tout moment, dès qu'une
-//      migration est détectée (subscribeMigration, temps réel — pas besoin
-//      d'attendre un snapshot pour l'apprendre) ou qu'une lecture montre
-//      complete=true / réserve à 0 (compte déjà vidé, rien à apprendre de
-//      plus).
+//      LONG_TAIL_DELAYS_S. Arrêt UNIQUEMENT quand une lecture RPC montre
+//      elle-même complete=true / réserve à 0 (compte vidé) — PAS sur
+//      subscribeMigration (changé le 2026-08-24 : cet événement s'est
+//      révélé arriver en retard de plusieurs minutes, parfois plus de
+//      30min, sur l'état réel on-chain, voir src/report.js section
+//      CALIBRATION — l'utiliser comme condition d'arrêt faisait
+//      systématiquement manquer la confirmation RPC de la complétion).
+//      migrated/migrated_at restent enregistrés normalement, comme
+//      information séparée (pumpportal_migration_at) ; curve_completed_at
+//      (horloge RPC, voir sql/schema.sql) est la nouvelle source de
+//      vérité pour "quand la curve a fini", avec l'écart entre les deux
+//      calculé par Postgres (curve_completion_lag_seconds).
 // Seuil calibré le 2026-08-23 sur les données réelles déjà collectées
 // (scripts/calibrate-activity-threshold.js) : le bruit flottant pur reste
 // sous 1e-8, la masse d'activité réelle démarre autour de 1e-4.
@@ -32,7 +39,14 @@
 // Les holders (src/holders.js, ~20 appels RPC — bien plus cher qu'une
 // lecture de bonding curve) suivent le MÊME gate : capturés une seule fois,
 // au premier point de la cascade étendue, donc seulement pour les tokens
-// jugés actifs — pas pour tout le monde comme avant.
+// jugés actifs — pas pour tout le monde comme avant. Depuis le 2026-08-24,
+// passent par une file RPC INDÉPENDANTE de la file bonding curve (voir
+// createRpcThrottle) : une capture holders (lente, retries sur 429 inclus
+// — le RPC public nous renvoie 429 sur ~100% de ces tentatives) ne doit
+// plus jamais retarder une lecture bonding curve, qui reste prioritaire
+// par construction. Un budget quotidien (HOLDERS_DAILY_BUDGET) protège
+// contre un martèlement indéfini d'un endpoint qui refuse
+// systématiquement.
 //
 // Rétention à deux niveaux (voir sql/schema.sql) : les métriques utiles
 // (bc_ratio_t5s/t10s/t20s/t30s, bc_first_active_at_s, bc_peak_ratio) sont
@@ -108,6 +122,15 @@ const ACTIVITY_REL_DEV_THRESHOLD = Number(process.env.ACTIVITY_REL_DEV_THRESHOLD
 // créations groupées plutôt que de compter sur le hasard de l'espacement
 // naturel.
 const BONDING_CURVE_RPC_MIN_INTERVAL_MS = Number(process.env.BONDING_CURVE_RPC_MIN_INTERVAL_MS) || 300;
+
+// File holders SÉPARÉE (2026-08-24) — voir en-tête de createRpcThrottle :
+// une capture holders (~20 appels internes à holders.js, chacun retenté
+// avec backoff sur 429) ne doit plus bloquer la file bonding curve. Son
+// propre espacement reste plus prudent (holders.js espace déjà ses appels
+// internes de 500ms) puisque le RPC public nous throttle systématiquement
+// dessus (100% d'échecs HTTP 429 constatés le 2026-08-24, voir
+// scripts/check-holders-error.js) — pas la peine d'insister plus vite.
+const HOLDERS_RPC_MIN_INTERVAL_MS = Number(process.env.HOLDERS_RPC_MIN_INTERVAL_MS) || 500;
 
 // Rétention à deux niveaux (voir sql/schema.sql) : token_snapshots purgée
 // après SNAPSHOT_RETENTION_MS, raw_new_token_event/raw_migration_event mis
@@ -303,6 +326,22 @@ function createDb(supabaseClient) {
       if (error) throw new Error(`closeExpiredWindows: ${error.message}`);
       return count ?? 0;
     },
+    // curve_completed_at_observed (2026-08-24) : posé une seule fois, à la
+    // première lecture RPC qui montre la curve terminée — .is(...,null)
+    // rend l'appel idempotent (un second appel pour le même mint, en
+    // théorie impossible puisque la cascade s'arrête dès isResolved(),
+    // resterait sans effet plutôt que d'écraser la première valeur).
+    // Horloge séparée de migrated_at (pumpportal_migration_at) : voir
+    // sql/schema.sql pour curve_completion_lag_seconds, calculé par
+    // Postgres à partir des deux.
+    async markCurveCompleted(mint) {
+      const { error } = await supabaseClient
+        .from('tokens')
+        .update({ curve_completed_at: new Date().toISOString() })
+        .eq('mint', mint)
+        .is('curve_completed_at', null);
+      if (error) throw new Error(`markCurveCompleted: ${error.message}`);
+    },
   };
 }
 
@@ -347,15 +386,51 @@ class EventBuffer {
 // --------------------------------------------------------------------
 
 // File qui espace les appels RPC d'au moins minIntervalMs, tous appelants
-// confondus. Chaque appel attend son tour puis s'exécute ; le résultat
-// (succès ou échec) de fn() est celui renvoyé à l'appelant.
+// confondus. Chaque appel attend son tour puis s'exécute. Retourne
+// {result, queueWaitMs, rpcCallMs} plutôt que le résultat nu — mesure
+// ajoutée le 2026-08-24 après avoir constaté des lectures bonding curve
+// enregistrées avec des heures de retard sur leur délai nominal, sans
+// pouvoir dire si le temps se perdait en file ou dans l'appel RPC
+// lui-même (retries sur 429 inclus). queueWaitMs = temps entre l'entrée
+// dans la file et le début de l'exécution ; rpcCallMs = durée de fn()
+// elle-même. Les deux sont écrits sur token_snapshots (voir
+// captureCascadeRead) pour pouvoir le mesurer après coup sans deviner.
 function createRpcThrottle(minIntervalMs) {
   let queue = Promise.resolve();
   return function enqueue(fn) {
-    const result = queue.then(fn);
-    queue = result.catch(() => {}).then(() => new Promise((resolve) => setTimeout(resolve, minIntervalMs)));
-    return result;
+    const queuedAtMs = Date.now();
+    const timed = queue.then(async () => {
+      const startedAtMs = Date.now();
+      const result = await fn();
+      return { result, queueWaitMs: startedAtMs - queuedAtMs, rpcCallMs: Date.now() - startedAtMs };
+    });
+    queue = timed.catch(() => {}).then(() => new Promise((resolve) => setTimeout(resolve, minIntervalMs)));
+    return timed;
   };
+}
+
+// Budget quotidien holders (2026-08-24) : découvert que le RPC public
+// nous renvoie HTTP 429 sur 100% des tentatives holders observées
+// (scripts/check-holders-error.js) — chaque tentative épuise ses retries
+// avant d'échouer, occupant sa propre file (désormais séparée de la file
+// bonding curve, voir main()) pendant plusieurs secondes pour rien à
+// chaque fois. Un plafond quotidien évite de marteler indéfiniment un
+// endpoint qui refuse systématiquement, même une fois isolé dans sa
+// propre file — la bonding curve reste prioritaire par construction
+// (files indépendantes), ceci est une protection supplémentaire.
+const HOLDERS_DAILY_BUDGET = Number(process.env.HOLDERS_DAILY_BUDGET) || 3000;
+let holdersBudgetDay = null;
+let holdersBudgetUsed = 0;
+function holdersBudgetAvailable() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== holdersBudgetDay) {
+    holdersBudgetDay = today;
+    holdersBudgetUsed = 0;
+  }
+  return holdersBudgetUsed < HOLDERS_DAILY_BUDGET;
+}
+function consumeHoldersBudget() {
+  holdersBudgetUsed += 1;
 }
 
 // Colonnes dérivées "point de contrôle" (voir sql/schema.sql) — seuls ces
@@ -374,9 +449,17 @@ function computeRelDev(observed, initial) {
 // foulée. Retourne {relDev, complete, virtualSolReserves} pour que
 // l'appelant décide de la suite (actif ? migré/vidé ?), ou null en cas
 // d'échec RPC — un échec n'interrompt pas la cascade, juste ce point-là.
+//
+// rpcThrottle et holdersThrottle sont deux files INDÉPENDANTES depuis le
+// 2026-08-24 : une capture holders peut prendre plusieurs secondes
+// (retries sur 429 compris — voir plus bas, le RPC public nous throttle
+// systématiquement sur ces appels) sans jamais retarder une lecture
+// bonding curve, qui reste prioritaire par construction plutôt que par
+// promesse.
 async function captureCascadeRead(
   db,
   rpcThrottle,
+  holdersThrottle,
   mint,
   createdAtMs,
   initialVSol,
@@ -385,7 +468,7 @@ async function captureCascadeRead(
 ) {
   const ageSeconds = Math.round((Date.now() - createdAtMs) / 1000);
   try {
-    const state = await rpcThrottle(() => fetchFn(SOLANA_RPC_URL, mint));
+    const { result: state, queueWaitMs, rpcCallMs } = await rpcThrottle(() => fetchFn(SOLANA_RPC_URL, mint));
     const row = {
       mint,
       age_seconds: ageSeconds,
@@ -393,16 +476,23 @@ async function captureCascadeRead(
       virtual_sol_reserves: state.virtual_quote_reserves_sol,
       virtual_token_reserves: state.virtual_token_reserves,
       raw_event: state,
+      queue_wait_ms: queueWaitMs,
+      rpc_call_ms: rpcCallMs,
     };
-    if (captureHolders) {
+    if (captureHolders && holdersBudgetAvailable()) {
+      consumeHoldersBudget();
       try {
         const { pda } = deriveBondingCurvePda(mint);
-        const holders = await rpcThrottle(() => holdersFetchFn(SOLANA_RPC_URL, mint, pda));
+        const { result: holders, queueWaitMs: holdersQueueWaitMs, rpcCallMs: holdersRpcCallMs } = await holdersThrottle(() =>
+          holdersFetchFn(SOLANA_RPC_URL, mint, pda)
+        );
         row.total_supply = holders.total_supply;
         row.curve_held_amount = holders.curve_held_amount;
         row.top_holders_count = holders.top_holders_count;
         row.top_holders_pct_of_supply = holders.top_holders_pct_of_supply;
         row.holders_raw = holders;
+        row.holders_queue_wait_ms = holdersQueueWaitMs;
+        row.holders_rpc_call_ms = holdersRpcCallMs;
       } catch (err) {
         row.holders_error = err.message;
       }
@@ -411,6 +501,17 @@ async function captureCascadeRead(
 
     const ratio = initialVSol ? state.virtual_quote_reserves_sol / initialVSol : null;
     await db.updateTokenDerivedMetrics(mint, { ratio, ageSeconds, checkpointColumn: CHECKPOINT_COLUMNS[nominalDelayS] });
+
+    // curve_completed_at_observed (2026-08-24) : premier instant où LE RPC
+    // lui-même montre la curve terminée, indépendant de subscribeMigration
+    // (mesuré en retard de plusieurs minutes à quelques dizaines de
+    // minutes sur l'état réel — voir src/report.js, section CALIBRATION).
+    // pumpportal_migration_at (colonne migrated_at) n'est ni modifiée ni
+    // remplacée : les deux horloges restent séparées, l'écart entre elles
+    // est calculé par Postgres (curve_completion_lag_seconds).
+    if (state.complete || state.virtual_quote_reserves_sol === 0) {
+      await db.markCurveCompleted(mint).catch(() => {});
+    }
 
     return { relDev: computeRelDev(state.virtual_quote_reserves_sol, initialVSol), complete: state.complete, virtualSolReserves: state.virtual_quote_reserves_sol };
   } catch (err) {
@@ -430,6 +531,7 @@ async function captureCascadeRead(
 function scheduleTokenCascade(
   db,
   rpcThrottle,
+  holdersThrottle,
   mint,
   createdAtMs,
   initialVSol,
@@ -479,7 +581,7 @@ function scheduleTokenCascade(
 
   async function runRead(delayS, opts) {
     if (stopped || isShuttingDown()) return null;
-    const result = await captureCascadeRead(db, rpcThrottle, mint, createdAtMs, initialVSol, delayS, { fetchFn, holdersFetchFn, ...opts });
+    const result = await captureCascadeRead(db, rpcThrottle, holdersThrottle, mint, createdAtMs, initialVSol, delayS, { fetchFn, holdersFetchFn, ...opts });
     if (isResolved(result)) stop();
     return result;
   }
@@ -574,10 +676,11 @@ async function main() {
   const db = createDb(createClient(supabaseUrl, supabaseKey, { auth: { persistSession: false } }));
   const buffer = new EventBuffer(db);
   const rpcThrottle = createRpcThrottle(BONDING_CURVE_RPC_MIN_INTERVAL_MS);
-  // mint -> {stop} des cascades en cours, pour pouvoir arrêter net dès
-  // qu'une migration arrive (voir le handler 'migration' ci-dessous) sans
-  // attendre le prochain point programmé.
-  const activeCascades = new Map();
+  // File indépendante pour holders (2026-08-24) : une capture holders ne
+  // doit plus jamais retarder une lecture bonding curve, qui reste
+  // prioritaire par construction (deux files séparées) plutôt que par
+  // promesse sur une file partagée — voir l'en-tête de createRpcThrottle.
+  const holdersThrottle = createRpcThrottle(HOLDERS_RPC_MIN_INTERVAL_MS);
 
   let ws = null;
   let lastMessageAt = Date.now();
@@ -616,44 +719,39 @@ async function main() {
         // reste largement dans le budget de requêtes Supabase Free vu le
         // débit (~1 création/3s).
         //
-        // L'upsert étant maintenant async, un événement 'migration' pour ce
-        // mint peut arriver AVANT que la cascade ne soit programmée (donc
-        // avant qu'elle existe dans activeCascades) — un placeholder
-        // synchrone absorbe un stop() prématuré via son propre flag, sur le
-        // même principe que le "stopped" interne de scheduleTokenCascade.
-        let stoppedBeforeScheduled = false;
-        activeCascades.set(row.mint, { stop: () => { stoppedBeforeScheduled = true; } });
+        // Plus besoin de suivre les cascades en cours (activeCascades a été
+        // retiré le 2026-08-24) : subscribeMigration ne déclenche plus
+        // d'arrêt externe (voir le handler 'migration' ci-dessous), donc
+        // rien n'a plus besoin d'appeler .stop() depuis l'extérieur — une
+        // cascade s'arrête seule, sur son propre isResolved().
         db.upsertNewTokens([row])
           .then(() => {
-            if (stoppedBeforeScheduled) {
-              activeCascades.delete(row.mint);
-              return;
-            }
-            const cascade = scheduleTokenCascade(
+            scheduleTokenCascade(
               db,
               rpcThrottle,
+              holdersThrottle,
               row.mint,
               Date.parse(row.created_at),
               row.initial_virtual_sol_reserves,
-              () => shuttingDown,
-              { onDone: (doneMint) => activeCascades.delete(doneMint) }
+              () => shuttingDown
             );
-            activeCascades.set(row.mint, cascade);
           })
           .catch((err) => {
-            activeCascades.delete(row.mint);
             db.logIngestion('bonding_curve_snapshot_error', `upsert immédiat échoué pour ${row.mint}, cascade non programmée: ${err.message}`).catch(() => {});
           });
       } else if (type === 'migration') {
         const migRow = buildMigrationRow(msg, nowIso);
         buffer.addMigration(migRow);
-        // Arrêt immédiat de la cascade en cours pour ce mint (voir en-tête
-        // du fichier) : la migration est le signal le plus fiable qu'il
-        // n'y a plus rien à apprendre de la bonding curve, pas la peine
-        // d'attendre le prochain point programmé pour s'en rendre compte.
-        // stop() déclenche onDone, qui retire l'entrée de activeCascades —
-        // pas besoin de le refaire ici.
-        activeCascades.get(migRow.mint)?.stop();
+        // NE déclenche PLUS l'arrêt de la cascade (changé le 2026-08-24) :
+        // subscribeMigration s'est révélé arriver en retard de plusieurs
+        // minutes, parfois plus de 30, sur l'état RPC réel (voir
+        // src/report.js, section CALIBRATION) — l'utiliser comme condition
+        // d'arrêt faisait manquer la confirmation RPC de la complétion la
+        // plupart du temps. migrated/migrated_at restent enregistrés
+        // normalement ci-dessus, comme information séparée
+        // (pumpportal_migration_at) ; seule captureCascadeRead (RPC
+        // lui-même montrant complete=true ou réserve à 0) arrête
+        // désormais une cascade.
       } else {
         // Probablement un accusé de souscription ou un format inattendu —
         // loggé pour inspection plutôt que silencieusement perdu.
