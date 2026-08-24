@@ -40,8 +40,11 @@ async function fetchAllRows(supabase, table, select, orderColumn, applyFilter) {
   return rows;
 }
 
-// Déploiement du throttle adaptatif (commit e9001df).
-const DEPLOY_AT = new Date(process.env.DEPLOY_AT || '2026-08-24T14:59:36Z');
+// Déploiement du CORRECTIF du throttle adaptatif (commit 8d5c872,
+// 2026-08-24) — le premier déploiement (e9001df, 14:59:36Z) s'est révélé
+// engorgé à 99% (voir le commit 8d5c872 pour le post-mortem) ; ce script
+// mesure désormais depuis le correctif, pas depuis le premier déploiement.
+const DEPLOY_AT = new Date(process.env.DEPLOY_AT || '2026-08-24T19:43:27Z');
 // Valeur par défaut du garde-fou de délai (BC_DEADLINE_MS) — sert à
 // estimer combien de lectures ont dû passer par lui.
 const BC_DEADLINE_MS = Number(process.env.BC_DEADLINE_MS) || 18_000;
