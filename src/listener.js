@@ -167,12 +167,22 @@ const BC_MAX_CAPACITY = Number(process.env.BC_MAX_CAPACITY) || 4;
 // 2026-08-24 : "garantir qu'une requête prévue à T+5s ne puisse pas être
 // retardée de plusieurs dizaines de secondes uniquement par notre queue").
 const BC_DEADLINE_MS = Number(process.env.BC_DEADLINE_MS) || 18_000;
-// Un appel bonding curve "propre" (aucun 429 rencontré, même rattrapé par
-// le retry de rpcCall) prend normalement <250ms (P90 mesuré=207ms, voir
-// analyze-v3-instrumentation.js) — au-dessus, on suppose qu'au moins un
-// 429 a été absorbé. Heuristique indirecte, comme la mesure du
-// 2026-08-24 : bondingCurve.js n'expose pas le nombre de tentatives.
-const BC_SOFT_429_RPC_CALL_MS_THRESHOLD = Number(process.env.BC_SOFT_429_RPC_CALL_MS_THRESHOLD) || 250;
+// Post-mortem du 2026-08-25, quelques heures après le premier déploiement
+// (scripts/analyze-adaptive-throttle.js) : 99% des lectures tombaient sur
+// le garde-fou (~18000ms) au lieu d'accélérer. Cause — ce seuil à 250ms
+// était calibré sur la latence mesurée à l'ANCIEN espacement fixe (300ms,
+// P90=207ms, sans contention), pas sur la réalité de l'adaptatif lui-même
+// : dès que la file accélère un peu, le P90 de rpc_call_ms observé monte
+// à 700-744ms (contention réseau normale, pas des 429) — bien plus de 10%
+// des appels dépassaient donc 250ms, chacun déclenchant noteRateLimited()
+// à tort (intervalle doublé, capacité effondrée à 1, palier de propreté
+// remis à zéro), empêchant quasi toujours d'atteindre les
+// BC_CLEAN_STREAK_TO_SPEED_UP lectures propres nécessaires pour accélérer
+// — la file restait donc bloquée près de son plafond, engorgée. Relevé à
+// 450ms : sous le premier palier de backoff réel de rpcCall (500ms), donc
+// toujours capable de détecter un vrai retry, mais au-dessus du bruit de
+// contention observé en production.
+const BC_SOFT_429_RPC_CALL_MS_THRESHOLD = Number(process.env.BC_SOFT_429_RPC_CALL_MS_THRESHOLD) || 450;
 
 // File holders SÉPARÉE (2026-08-24) — voir en-tête de createRpcThrottle :
 // une capture holders (~20 appels internes à holders.js, chacun retenté
@@ -525,23 +535,39 @@ function createAdaptiveBondingCurveThrottle() {
   function pump() {
     if (!pending.length) return;
     refill();
-    const now = Date.now();
-    while (pending.length) {
+    // 1) Dispatch normal via les jetons disponibles — peut lâcher jusqu'à
+    //    `capacity` lectures d'un coup (rafale VOULUE, bornée par le
+    //    seau de jetons).
+    while (pending.length && tokens >= 1) {
       const item = pending[0];
-      const forced = now - item.queuedAtMs >= BC_DEADLINE_MS;
-      if (tokens < 1 && !forced) break;
       pending.shift();
-      if (tokens >= 1) tokens -= 1;
-      dispatch(item, forced);
+      tokens -= 1;
+      dispatch(item, false);
+    }
+    // 2) Garde-fou de délai : AU PLUS UNE lecture forcée par appel de
+    //    pump(), jamais toute la file en une fois. Post-mortem du
+    //    2026-08-25 : sans cette limite, un engorgement fait passer
+    //    d'un coup toutes les lectures en retard dès qu'elles atteignent
+    //    le seuil, créant une vraie rafale simultanée vers le RPC — donc
+    //    de la contention réelle, qui redéclenche noteRateLimited() et
+    //    entretient l'engorgement au lieu de le résorber. schedulePump()
+    //    ci-dessous re-réveille pump() pour la suivante, espacée d'au
+    //    moins BC_MIN_INTERVAL_MS.
+    if (pending.length) {
+      const item = pending[0];
+      if (Date.now() - item.queuedAtMs >= BC_DEADLINE_MS) {
+        pending.shift();
+        dispatch(item, true);
+      }
     }
     if (pending.length) {
       // Réveille au plus tôt entre "prochain jeton disponible" et
-      // "l'item le plus ancien atteint le garde-fou de délai" — sans ce
-      // second terme, un intervalMs lent (ex. après un ralentissement sur
-      // 429) retarderait aussi le garde-fou lui-même, ce qui viderait sa
-      // garantie de sens.
+      // "l'item le plus ancien atteint (ou a déjà dépassé) le garde-fou
+      // de délai" — plancher à BC_MIN_INTERVAL_MS pour ne jamais
+      // re-déclencher pump() en boucle serrée quand plusieurs lectures
+      // sont déjà toutes en retard.
       const timeToNextToken = intervalMs - (Date.now() - lastRefillAt);
-      const timeToDeadline = BC_DEADLINE_MS - (Date.now() - pending[0].queuedAtMs);
+      const timeToDeadline = Math.max(BC_MIN_INTERVAL_MS, BC_DEADLINE_MS - (Date.now() - pending[0].queuedAtMs));
       schedulePump(Math.min(timeToNextToken, timeToDeadline));
     }
   }
@@ -566,9 +592,16 @@ function createAdaptiveBondingCurveThrottle() {
     } catch (err) {
       if (/429/.test(err.message)) noteRateLimited();
       item.reject(err);
-    } finally {
-      pump();
     }
+    // Pas de pump() ici (post-mortem 2026-08-25) : rien ne devient
+    // dispatchable PARCE QU'un appel vient de se terminer — les jetons se
+    // rechargent avec le temps (déjà couvert par le minuteur de
+    // schedulePump), pas à la complétion d'un appel. Un pump() ici
+    // court-circuitait l'espacement du garde-fou de délai : la résolution
+    // d'un dispatch forcé relançait aussitôt pump() (dans un microtask,
+    // donc quasi au même instant), qui forçait le suivant, qui relançait
+    // encore pump()... — toute la file en retard partait alors d'un coup
+    // au lieu d'être étalée par schedulePump().
   }
 
   return function enqueue(fn, scheduledAtMs) {
