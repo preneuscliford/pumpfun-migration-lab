@@ -343,24 +343,61 @@ async function main() {
       { label: 'B. progressive [CIBLE]', tokens: v2B },
       { label: 'C. non-migré [témoin]', tokens: v2C },
     ];
+
+    // Piège identifié en observant les premiers résultats V2 (2026-08-24) :
+    // le compte de bonding curve est VIDÉ après la migration (0/0, voir
+    // scripts/check-bonding-curve-rpc.js). Un token B dont
+    // time_to_migration_seconds <= le délai nominal du checkpoint a donc
+    // DÉJÀ migré au moment de cette lecture — bc_ratio_tXs y mesure "déjà
+    // vidé", pas "pression d'achat avant la migration". Mélanger les deux
+    // dans B fait mécaniquement chuter la médiane vers 0 et fabrique une
+    // séparation B/C qui ne dit rien sur ce qu'on cherche : un signal
+    // observable AVANT que la migration soit connue. On ne garde donc, pour
+    // B, que les lectures dont le token n'avait pas encore migré à ce
+    // délai — la vraie comparaison pré-migration B vs C.
+    const NOMINAL_DELAY_BY_COLUMN = { bc_ratio_t5s: 5, bc_ratio_t10s: 10, bc_ratio_t20s: 20, bc_ratio_t30s: 30 };
     for (const col of ['bc_ratio_t5s', 'bc_ratio_t10s', 'bc_ratio_t20s', 'bc_ratio_t30s']) {
+      const delay = NOMINAL_DELAY_BY_COLUMN[col];
+      const bPreMigration = v2B.filter((t) => t.time_to_migration_seconds !== null && t.time_to_migration_seconds !== undefined && t.time_to_migration_seconds > delay);
+      const bAlreadyMigrated = v2B.length - bPreMigration.length;
+      console.log(`\n  [${col}] groupe B : ${bPreMigration.length} pas encore migré(s) à T+${delay}s (gardés) / ${bAlreadyMigrated} déjà migré(s) à ce moment (exclus, compte vidé)`);
       printFeatureDistribution(
-        `${col} (couverture entre parenthèses = part des tokens ayant une lecture à ce point)`,
-        bcGroups.map((g) => {
+        `${col}, PRÉ-migration seulement pour B (couverture entre parenthèses = part des tokens éligibles ayant une lecture à ce point)`,
+        [
+          { label: bcGroups[0].label, tokens: bPreMigration },
+          bcGroups[1],
+        ].map((g) => {
           const withValue = g.tokens.filter((t) => t[col] !== null && t[col] !== undefined);
           const coverage = g.tokens.length ? ((withValue.length / g.tokens.length) * 100).toFixed(1) : '0.0';
           return { label: `${g.label} (${coverage}%)`, values: g.tokens.map((t) => t[col]) };
         })
       );
     }
+    // Même piège que ci-dessus : pour B, une détection "active" causée par
+    // le vidage du compte APRÈS migration (bc_first_active_at_s >=
+    // time_to_migration_seconds) n'est pas un signal précoce, c'est la
+    // migration elle-même qui se voit. On sépare donc "détecté actif AVANT
+    // sa propre migration" (le vrai signal) de "détecté seulement au
+    // moment/après" (artefact). C n'a pas ce problème (jamais migré).
     console.log('\n  bc_first_active_at_s (âge en secondes de la 1re lecture jugée active — NULL = jamais détecté actif) :');
     for (const g of bcGroups) {
       const active = g.tokens.filter((t) => t.bc_first_active_at_s !== null && t.bc_first_active_at_s !== undefined);
       const pct = g.tokens.length ? ((active.length / g.tokens.length) * 100).toFixed(1) : '0.0';
       console.log(`    ${g.label.padEnd(24)} actifs=${active.length}/${g.tokens.length} (${pct}%)  ${fmtDistStats(distStats(active.map((t) => t.bc_first_active_at_s)))}`);
+      if (g === bcGroups[0]) {
+        const preMig = active.filter((t) => t.bc_first_active_at_s < t.time_to_migration_seconds);
+        const atOrAfterMig = active.length - preMig.length;
+        console.log(`      dont détecté AVANT sa propre migration (signal réel) : ${preMig.length}/${active.length}  ${fmtDistStats(distStats(preMig.map((t) => t.bc_first_active_at_s)))}`);
+        console.log(`      dont détecté au moment/après sa migration (artefact du vidage) : ${atOrAfterMig}/${active.length}`);
+      }
     }
+    // bc_peak_ratio n'est PAS décomposé pré/post-migration : on ne garde en
+    // base que la valeur agrégée (le ratio le plus extrême toutes lectures
+    // confondues), pas quel checkpoint l'a produite — impossible de savoir
+    // après coup si ce pic vient d'avant ou après la migration pour B. À
+    // lire comme un indicateur brut, pas encore nettoyé du même artefact.
     printFeatureDistribution(
-      'bc_peak_ratio (écart max observé par rapport à 1, toutes lectures confondues)',
+      'bc_peak_ratio (écart max observé par rapport à 1, toutes lectures confondues — PAS nettoyé du vidage post-migration pour B)',
       bcGroups.map((g) => ({ label: g.label, values: g.tokens.map((t) => t.bc_peak_ratio) }))
     );
   }
