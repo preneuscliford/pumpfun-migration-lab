@@ -175,7 +175,22 @@ create table if not exists token_snapshots (
   queue_wait_ms integer,
   rpc_call_ms integer,
   holders_queue_wait_ms integer,
-  holders_rpc_call_ms integer
+  holders_rpc_call_ms integer,
+
+  -- Horodatages absolus du throttle adaptatif bonding curve (2026-08-25,
+  -- voir createAdaptiveBondingCurveThrottle dans src/listener.js) — en
+  -- plus des durées dérivées ci-dessus (queue_wait_ms/rpc_call_ms),
+  -- permettent de rejouer précisément "prévu vs exécuté" sans recalcul
+  -- approximatif. scheduled_at = created_at + nominal_delay_s (l'instant
+  -- VISÉ) ; queued_at = entrée dans la file adaptative ; started_at =
+  -- début effectif de l'appel RPC (jeton obtenu ou garde-fou de délai
+  -- déclenché) ; completed_at = fin de l'appel. NULL pour holders (reste
+  -- sur l'ancien throttle à espacement fixe, inchangé) et pour les lignes
+  -- collectées avant cette date.
+  scheduled_at timestamptz,
+  queued_at timestamptz,
+  started_at timestamptz,
+  completed_at timestamptz
 );
 
 create index if not exists idx_snapshots_mint_time on token_snapshots (mint, captured_at);
@@ -227,3 +242,22 @@ alter table token_snapshots add column if not exists queue_wait_ms integer;
 alter table token_snapshots add column if not exists rpc_call_ms integer;
 alter table token_snapshots add column if not exists holders_queue_wait_ms integer;
 alter table token_snapshots add column if not exists holders_rpc_call_ms integer;
+
+-- Migration V2.2 (2026-08-25) — à exécuter une fois dans l'éditeur SQL
+-- Supabase, comme les blocs précédents. Horodatages absolus du throttle
+-- adaptatif bonding curve — voir le commentaire sur les colonnes
+-- token_snapshots plus haut dans ce fichier pour le contexte complet.
+-- IMPORTANT (leçon du 2026-08-24) : exécuter ce bloc PENDANT que le
+-- listener en cours tourne encore expose à un deadlock (AccessExclusiveLock
+-- de l'ALTER TABLE vs RowShareLock du listener qui écrit) — annuler le run
+-- Listener actif avant d'exécuter cette migration. Après exécution,
+-- recharger le cache de schéma PostgREST avant de relancer le listener :
+--   notify pgrst, 'reload schema';
+-- Sans ce rechargement, tous les inserts token_snapshots échoueront
+-- silencieusement avec "Could not find the 'scheduled_at' column..." tant
+-- que le cache n'a pas été rafraîchi (déjà vu avec la V2.1).
+alter table token_snapshots add column if not exists scheduled_at timestamptz;
+alter table token_snapshots add column if not exists queued_at timestamptz;
+alter table token_snapshots add column if not exists started_at timestamptz;
+alter table token_snapshots add column if not exists completed_at timestamptz;
+notify pgrst, 'reload schema';

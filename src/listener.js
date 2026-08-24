@@ -48,6 +48,21 @@
 // contre un martèlement indéfini d'un endpoint qui refuse
 // systématiquement.
 //
+// File bonding curve adaptative (2026-08-25, voir
+// createAdaptiveBondingCurveThrottle) : mesuré la veille
+// (scripts/measure-bonding-curve-429-rate.js) 0% d'échec définitif par 429
+// sur bonding curve à l'espacement fixe de 300ms (~9,3% de 429 absorbés
+// par le retry interne, jamais visibles en échec) — de la marge existe
+// pour accélérer. Mais l'espacement fixe seul ne bornait pas le pire cas
+// en rafale de créations (P99 queue_wait_ms=121s, max=145s mesurés le
+// même jour). Remplacé par un seau de jetons (token bucket) dont
+// l'intervalle et la capacité de rafale s'ajustent en continu (AIMD :
+// accélère prudemment sur série propre, ralentit fort et tout de suite au
+// moindre 429), plus un garde-fou de délai (BC_DEADLINE_MS) qui force le
+// passage d'une lecture bloquée trop longtemps quel que soit l'état de
+// l'adaptatif. Holders INCHANGÉ (reste sur createRpcThrottle, espacement
+// fixe) — rien à gagner à accélérer un endpoint qui refuse 100% du temps.
+//
 // Rétention à deux niveaux (voir sql/schema.sql) : les métriques utiles
 // (bc_ratio_t5s/t10s/t20s/t30s, bc_first_active_at_s, bc_peak_ratio) sont
 // recopiées sur tokens EN DIRECT à chaque lecture, pas recalculées après
@@ -120,8 +135,44 @@ const ACTIVITY_REL_DEV_THRESHOLD = Number(process.env.ACTIVITY_REL_DEV_THRESHOLD
 // Espacement minimum entre deux appels RPC bonding-curve/holders, tous
 // tokens confondus — protège le RPC public gratuit d'un afflux de
 // créations groupées plutôt que de compter sur le hasard de l'espacement
-// naturel.
+// naturel. Valeur INITIALE du throttle adaptatif bonding curve depuis le
+// 2026-08-25 (voir createAdaptiveBondingCurveThrottle) — reste la valeur
+// fixe utilisée par holders (inchangé).
 const BONDING_CURVE_RPC_MIN_INTERVAL_MS = Number(process.env.BONDING_CURVE_RPC_MIN_INTERVAL_MS) || 300;
+
+// Throttle adaptatif bonding curve (2026-08-25) — mesuré la veille
+// (scripts/measure-bonding-curve-429-rate.js, ~51 000 tentatives à
+// l'espacement fixe de 300ms) : 0 échec définitif par 429, ~9,3% de 429
+// absorbés par le retry interne de rpcCall (bondingCurve.js) — de la
+// marge existe pour accélérer. Mais l'espacement fixe seul ne bornait pas
+// le pire cas en rafale de créations : P90 queue_wait_ms=48s, P99=121s,
+// max=145s mesurés le même jour (scripts/analyze-v3-instrumentation.js)
+// alors que 90% des lectures étaient propres. BC_MIN_INTERVAL_MS par
+// défaut ne dépasse jamais BC_INITIAL_INTERVAL_MS : sans ce plafonnement,
+// un intervalle initial déjà rapide (ex. tests d'intégration, 10ms) se
+// ferait remonter au plancher de prod (80ms) dès le premier palier
+// d'accélération — comportement non voulu, seulement un filet de
+// sécurité pour l'intervalle de prod (300ms).
+const BC_INITIAL_INTERVAL_MS = Number(process.env.BC_INITIAL_INTERVAL_MS) || BONDING_CURVE_RPC_MIN_INTERVAL_MS;
+const BC_MIN_INTERVAL_MS = Number(process.env.BC_MIN_INTERVAL_MS) || Math.min(80, BC_INITIAL_INTERVAL_MS);
+const BC_MAX_INTERVAL_MS = Number(process.env.BC_MAX_INTERVAL_MS) || 3000;
+const BC_INTERVAL_STEP_DOWN_MS = Number(process.env.BC_INTERVAL_STEP_DOWN_MS) || 20;
+const BC_INTERVAL_BACKOFF_FACTOR = Number(process.env.BC_INTERVAL_BACKOFF_FACTOR) || 2;
+const BC_CLEAN_STREAK_TO_SPEED_UP = Number(process.env.BC_CLEAN_STREAK_TO_SPEED_UP) || 30;
+const BC_MIN_CAPACITY = 1;
+const BC_MAX_CAPACITY = Number(process.env.BC_MAX_CAPACITY) || 4;
+// Garde-fou : une lecture en attente depuis plus longtemps que ceci est
+// dispatchée immédiatement, jeton ou pas — borne le pire cas
+// indépendamment de l'état de l'adaptatif (demandé explicitement le
+// 2026-08-24 : "garantir qu'une requête prévue à T+5s ne puisse pas être
+// retardée de plusieurs dizaines de secondes uniquement par notre queue").
+const BC_DEADLINE_MS = Number(process.env.BC_DEADLINE_MS) || 18_000;
+// Un appel bonding curve "propre" (aucun 429 rencontré, même rattrapé par
+// le retry de rpcCall) prend normalement <250ms (P90 mesuré=207ms, voir
+// analyze-v3-instrumentation.js) — au-dessus, on suppose qu'au moins un
+// 429 a été absorbé. Heuristique indirecte, comme la mesure du
+// 2026-08-24 : bondingCurve.js n'expose pas le nombre de tentatives.
+const BC_SOFT_429_RPC_CALL_MS_THRESHOLD = Number(process.env.BC_SOFT_429_RPC_CALL_MS_THRESHOLD) || 250;
 
 // File holders SÉPARÉE (2026-08-24) — voir en-tête de createRpcThrottle :
 // une capture holders (~20 appels internes à holders.js, chacun retenté
@@ -409,6 +460,125 @@ function createRpcThrottle(minIntervalMs) {
   };
 }
 
+// Throttle adaptatif dédié à la bonding curve (2026-08-25) — voir les
+// constantes BC_* juste au-dessus pour le contexte/les chiffres mesurés
+// qui ont motivé ce choix. Seau de jetons (token bucket) : `capacity`
+// jetons disponibles immédiatement à tout instant (absorbe une rafale de
+// créations sans attendre), rechargés au rythme `intervalMs`. Les deux
+// s'ajustent en continu — AIMD (Additive Increase / Multiplicative
+// Decrease, le mécanisme standard des limiteurs de débit adaptatifs) :
+// accélère prudemment par petits paliers après une série de lectures
+// propres, ralentit fort et tout de suite dès qu'un 429 est rencontré
+// (même rattrapé par le retry interne de rpcCall — voir
+// BC_SOFT_429_RPC_CALL_MS_THRESHOLD). Le garde-fou BC_DEADLINE_MS force le
+// passage d'une lecture qui aurait trop attendu même sans jeton
+// disponible : sans lui, l'adaptatif pourrait rester prudent
+// indéfiniment pendant qu'une lecture reste bloquée derrière une rafale.
+// N'est PAS utilisé pour holders (reste sur createRpcThrottle ci-dessus,
+// simple espacement fixe) — inchangé par design (100% de 429 mesurés
+// là-bas, rien à gagner à accélérer tant que cet endpoint refuse
+// systématiquement).
+function createAdaptiveBondingCurveThrottle() {
+  let intervalMs = BC_INITIAL_INTERVAL_MS;
+  let capacity = BC_MIN_CAPACITY;
+  let tokens = capacity;
+  let cleanStreak = 0;
+  let lastRefillAt = Date.now();
+  const pending = [];
+  let pumpTimer = null;
+
+  function refill() {
+    const now = Date.now();
+    const elapsed = now - lastRefillAt;
+    if (elapsed <= 0) return;
+    const newTokens = Math.floor(elapsed / intervalMs);
+    if (newTokens > 0) {
+      tokens = Math.min(capacity, tokens + newTokens);
+      lastRefillAt += newTokens * intervalMs;
+    }
+  }
+
+  function noteClean() {
+    cleanStreak += 1;
+    if (cleanStreak % BC_CLEAN_STREAK_TO_SPEED_UP !== 0) return;
+    intervalMs = Math.max(BC_MIN_INTERVAL_MS, intervalMs - BC_INTERVAL_STEP_DOWN_MS);
+    if (cleanStreak % (BC_CLEAN_STREAK_TO_SPEED_UP * 2) === 0) {
+      capacity = Math.min(BC_MAX_CAPACITY, capacity + 1);
+    }
+  }
+
+  function noteRateLimited() {
+    cleanStreak = 0;
+    intervalMs = Math.min(BC_MAX_INTERVAL_MS, Math.round(intervalMs * BC_INTERVAL_BACKOFF_FACTOR));
+    capacity = BC_MIN_CAPACITY;
+    tokens = Math.min(tokens, capacity);
+  }
+
+  function schedulePump(delayMs) {
+    if (pumpTimer) return;
+    pumpTimer = setTimeout(() => {
+      pumpTimer = null;
+      pump();
+    }, Math.max(0, delayMs));
+  }
+
+  function pump() {
+    if (!pending.length) return;
+    refill();
+    const now = Date.now();
+    while (pending.length) {
+      const item = pending[0];
+      const forced = now - item.queuedAtMs >= BC_DEADLINE_MS;
+      if (tokens < 1 && !forced) break;
+      pending.shift();
+      if (tokens >= 1) tokens -= 1;
+      dispatch(item, forced);
+    }
+    if (pending.length) {
+      // Réveille au plus tôt entre "prochain jeton disponible" et
+      // "l'item le plus ancien atteint le garde-fou de délai" — sans ce
+      // second terme, un intervalMs lent (ex. après un ralentissement sur
+      // 429) retarderait aussi le garde-fou lui-même, ce qui viderait sa
+      // garantie de sens.
+      const timeToNextToken = intervalMs - (Date.now() - lastRefillAt);
+      const timeToDeadline = BC_DEADLINE_MS - (Date.now() - pending[0].queuedAtMs);
+      schedulePump(Math.min(timeToNextToken, timeToDeadline));
+    }
+  }
+
+  async function dispatch(item, forcedByDeadline) {
+    const startedAtMs = Date.now();
+    try {
+      const result = await item.fn();
+      const rpcCallMs = Date.now() - startedAtMs;
+      if (rpcCallMs >= BC_SOFT_429_RPC_CALL_MS_THRESHOLD) noteRateLimited();
+      else noteClean();
+      item.resolve({
+        result,
+        queueWaitMs: startedAtMs - item.queuedAtMs,
+        rpcCallMs,
+        scheduledAt: item.scheduledAtMs ?? null,
+        queuedAt: item.queuedAtMs,
+        startedAt: startedAtMs,
+        completedAt: Date.now(),
+        forcedByDeadline,
+      });
+    } catch (err) {
+      if (/429/.test(err.message)) noteRateLimited();
+      item.reject(err);
+    } finally {
+      pump();
+    }
+  }
+
+  return function enqueue(fn, scheduledAtMs) {
+    return new Promise((resolve, reject) => {
+      pending.push({ fn, queuedAtMs: Date.now(), scheduledAtMs, resolve, reject });
+      pump();
+    });
+  };
+}
+
 // Budget quotidien holders (2026-08-24) : découvert que le RPC public
 // nous renvoie HTTP 429 sur 100% des tentatives holders observées
 // (scripts/check-holders-error.js) — chaque tentative épuise ses retries
@@ -467,8 +637,17 @@ async function captureCascadeRead(
   { captureHolders = false, fetchFn = fetchBondingCurveState, holdersFetchFn = fetchHolderConcentration } = {}
 ) {
   const ageSeconds = Math.round((Date.now() - createdAtMs) / 1000);
+  const scheduledAtMs = createdAtMs + nominalDelayS * 1000;
   try {
-    const { result: state, queueWaitMs, rpcCallMs } = await rpcThrottle(() => fetchFn(SOLANA_RPC_URL, mint));
+    const {
+      result: state,
+      queueWaitMs,
+      rpcCallMs,
+      scheduledAt,
+      queuedAt,
+      startedAt,
+      completedAt,
+    } = await rpcThrottle(() => fetchFn(SOLANA_RPC_URL, mint), scheduledAtMs);
     const row = {
       mint,
       age_seconds: ageSeconds,
@@ -478,6 +657,17 @@ async function captureCascadeRead(
       raw_event: state,
       queue_wait_ms: queueWaitMs,
       rpc_call_ms: rpcCallMs,
+      // Horodatages absolus (2026-08-25), en plus des durées dérivées
+      // ci-dessus — demandé explicitement pour pouvoir rejouer précisément
+      // "prévu vs exécuté" plus tard sans recalcul approximatif.
+      // scheduledAt/queuedAt/startedAt/completedAt sont undefined pour
+      // holders (createRpcThrottle, inchangé) mais rpcThrottle ici est
+      // toujours le throttle adaptatif bonding curve, qui les fournit
+      // systématiquement.
+      scheduled_at: scheduledAt != null ? new Date(scheduledAt).toISOString() : null,
+      queued_at: queuedAt != null ? new Date(queuedAt).toISOString() : null,
+      started_at: startedAt != null ? new Date(startedAt).toISOString() : null,
+      completed_at: completedAt != null ? new Date(completedAt).toISOString() : null,
     };
     if (captureHolders && holdersBudgetAvailable()) {
       consumeHoldersBudget();
@@ -675,7 +865,11 @@ async function main() {
   const supabaseKey = requireEnv('SUPABASE_SERVICE_KEY');
   const db = createDb(createClient(supabaseUrl, supabaseKey, { auth: { persistSession: false } }));
   const buffer = new EventBuffer(db);
-  const rpcThrottle = createRpcThrottle(BONDING_CURVE_RPC_MIN_INTERVAL_MS);
+  // Throttle adaptatif (2026-08-25, voir createAdaptiveBondingCurveThrottle)
+  // — remplace l'espacement fixe à 300ms : accélère quand le RPC absorbe
+  // sans 429, ralentit fort et tout de suite au moindre 429 rencontré, et
+  // garantit un plafond de retard via son garde-fou de délai (BC_DEADLINE_MS).
+  const rpcThrottle = createAdaptiveBondingCurveThrottle();
   // File indépendante pour holders (2026-08-24) : une capture holders ne
   // doit plus jamais retarder une lecture bonding curve, qui reste
   // prioritaire par construction (deux files séparées) plutôt que par
@@ -859,6 +1053,7 @@ module.exports = {
   EventBuffer,
   triggerNextRun,
   createRpcThrottle,
+  createAdaptiveBondingCurveThrottle,
   computeRelDev,
   captureCascadeRead,
   scheduleTokenCascade,
