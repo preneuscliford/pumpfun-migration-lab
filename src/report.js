@@ -400,6 +400,56 @@ async function main() {
       'bc_peak_ratio (écart max observé par rapport à 1, toutes lectures confondues — PAS nettoyé du vidage post-migration pour B)',
       bcGroups.map((g) => ({ label: g.label, values: g.tokens.map((t) => t.bc_peak_ratio) }))
     );
+
+    // Calibration de la latence de l'événement migrate (2026-08-24) : un
+    // bc_ratio_t5s ~0 dès T+2s sur des tokens classés "pas encore migrés"
+    // (time_to_migration_seconds > délai du checkpoint, filtre ci-dessus)
+    // n'a mécaniquement de sens que si le compte de bonding curve est déjà
+    // vidé (voir "0/0 attendu... après la migration" ailleurs dans ce
+    // fichier) — donc si l'événement subscribeMigration (qui fixe
+    // migrated_at, et donc time_to_migration_seconds) arrive APRÈS l'état
+    // réel on-chain plutôt qu'avant. Vérification directe, sans supposition :
+    // pour chaque token B, âge de la PREMIÈRE lecture de cascade montrant
+    // virtual_sol_reserves=0 (signe fiable de vidage, indépendant de tout
+    // événement WS), comparé à time_to_migration_seconds enregistré.
+    if (v2B.length) {
+      const bMintsV2 = v2B.map((t) => t.mint);
+      const MINT_BATCH_SIZE = 150;
+      const drainedSnapshots = [];
+      for (let i = 0; i < bMintsV2.length; i += MINT_BATCH_SIZE) {
+        const batch = bMintsV2.slice(i, i + MINT_BATCH_SIZE);
+        const rows = await fetchAllRows(supabase, 'token_snapshots', 'mint, age_seconds, virtual_sol_reserves', 'id', (q) =>
+          q.in('mint', batch).eq('virtual_sol_reserves', 0)
+        );
+        drainedSnapshots.push(...rows);
+      }
+      const firstDrainAgeByMint = new Map();
+      for (const s of drainedSnapshots) {
+        const cur = firstDrainAgeByMint.get(s.mint);
+        if (cur === undefined || s.age_seconds < cur) firstDrainAgeByMint.set(s.mint, s.age_seconds);
+      }
+      const gaps = [];
+      for (const t of v2B) {
+        const firstDrainAge = firstDrainAgeByMint.get(t.mint);
+        if (firstDrainAge === undefined || t.time_to_migration_seconds === null || t.time_to_migration_seconds === undefined) continue;
+        gaps.push(t.time_to_migration_seconds - firstDrainAge);
+      }
+      console.log('\n' + '='.repeat(72));
+      console.log('CALIBRATION — latence de l\'événement migrate (subscribeMigration)');
+      console.log('  écart = time_to_migration_seconds (enregistré) - âge de la 1re lecture');
+      console.log('  RPC montrant le compte déjà vidé. écart > 0 = le RPC voit la migration');
+      console.log('  AVANT que l\'événement WS ne l\'annonce (donc migrated_at est en retard).');
+      console.log('='.repeat(72));
+      console.log(`\n  tokens B avec au moins une lecture "vidé" observée : ${firstDrainAgeByMint.size}/${v2B.length}`);
+      if (gaps.length) {
+        printProfileStats('écart (secondes)', gaps);
+        console.log(`  écart > 0 (RPC en avance sur l'événement WS) : ${gaps.filter((g) => g > 0).length}/${gaps.length}`);
+        console.log(`  écart < 0 (événement WS déjà connu avant qu'on voie le vidage) : ${gaps.filter((g) => g < 0).length}/${gaps.length}`);
+        console.log(`  écart = 0 : ${gaps.filter((g) => g === 0).length}/${gaps.length}`);
+      } else {
+        console.log('\n  Aucune lecture "vidé" trouvée pour le groupe B pour le moment — trop tôt ou fenêtre snapshots déjà purgée.');
+      }
+    }
   }
 
   const log = await fetchAllRows(supabase, 'ingestion_log', 'event_type, at, id', 'id');
