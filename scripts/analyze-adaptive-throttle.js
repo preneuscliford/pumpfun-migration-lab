@@ -40,11 +40,14 @@ async function fetchAllRows(supabase, table, select, orderColumn, applyFilter) {
   return rows;
 }
 
-// Déploiement du CORRECTIF du throttle adaptatif (commit 8d5c872,
-// 2026-08-24) — le premier déploiement (e9001df, 14:59:36Z) s'est révélé
-// engorgé à 99% (voir le commit 8d5c872 pour le post-mortem) ; ce script
-// mesure désormais depuis le correctif, pas depuis le premier déploiement.
-const DEPLOY_AT = new Date(process.env.DEPLOY_AT || '2026-08-24T19:43:27Z');
+// Déploiement du 2e CORRECTIF du throttle adaptatif (commit 2410c37,
+// 2026-08-24 20:46:32Z) — le 1er correctif (8d5c872, 19:43:27Z) a réduit
+// le recours au garde-fou (99,12% -> 82,70% après 8min) mais la mesure a
+// ensuite EMPIRÉ sur 1h (82,70% -> 95,55%) : le pacage des lectures
+// forcées utilisait encore BC_MIN_INTERVAL_MS (trop rapide) au lieu de
+// l'intervalle adaptatif courant. Ce script mesure désormais depuis ce
+// 2e correctif.
+const DEPLOY_AT = new Date(process.env.DEPLOY_AT || '2026-08-24T20:46:32Z');
 // Valeur par défaut du garde-fou de délai (BC_DEADLINE_MS) — sert à
 // estimer combien de lectures ont dû passer par lui.
 const BC_DEADLINE_MS = Number(process.env.BC_DEADLINE_MS) || 18_000;
