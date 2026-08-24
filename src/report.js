@@ -312,47 +312,57 @@ async function main() {
     `  ${'is_mayhem_mode=true'.padEnd(38)} ${bMayhemKnown.length ? `${bMayhemTrue}/${bMayhemKnown.length} (${((bMayhemTrue / bMayhemKnown.length) * 100).toFixed(1)}%)` : 'n=0'}`
   );
 
-  if (bTokens.length) {
-    const bMints = bTokens.map((t) => t.mint);
-    // .in('mint', bMints) sur des centaines de mints dépasse la longueur
-    // d'URL acceptée par PostgREST ("Bad Request", repéré le 2026-08-23
-    // avec n=900) — on découpe en lots plutôt que d'envoyer un seul filtre
-    // géant. La taille de lot (150) est un compromis prudent, pas une
-    // valeur mesurée précisément.
-    const MINT_BATCH_SIZE = 150;
-    const bSnapshots = [];
-    for (let i = 0; i < bMints.length; i += MINT_BATCH_SIZE) {
-      const batch = bMints.slice(i, i + MINT_BATCH_SIZE);
-      const rows = await fetchAllRows(
-        supabase,
-        'token_snapshots',
-        'mint, age_seconds, virtual_sol_reserves, virtual_token_reserves',
-        'id',
-        (q) => q.in('mint', batch)
-      );
-      bSnapshots.push(...rows);
-    }
-    // Regroupement par délai nominal le plus proche (30s/1min/3min/5min,
-    // voir listener.js) : age_seconds réel varie légèrement autour de la
-    // cible à cause de la latence RPC, pas la peine d'exiger une valeur
-    // exacte pour regrouper les points comparables entre eux.
-    const NOMINAL_DELAYS_S = [30, 60, 180, 300];
-    const byDelay = new Map(NOMINAL_DELAYS_S.map((d) => [d, []]));
-    for (const s of bSnapshots) {
-      const nearest = NOMINAL_DELAYS_S.reduce((a, b) => (Math.abs(b - s.age_seconds) < Math.abs(a - s.age_seconds) ? b : a));
-      byDelay.get(nearest).push(s);
-    }
-    console.log('\nTrajectoire de bonding curve (regroupée par délai nominal le plus proche) :');
-    console.log('  0/0 attendu dès que le snapshot tombe après la migration (compte vidé —');
-    console.log('  voir la validation dans scripts/check-bonding-curve-rpc.js).');
-    for (const d of NOMINAL_DELAYS_S) {
-      const pts = byDelay.get(d);
-      console.log(`\n  ~${d}s (n=${pts.length}) :`);
-      printProfileStats('virtual_sol_reserves', pts.map((p) => p.virtual_sol_reserves));
-      printProfileStats('virtual_token_reserves', pts.map((p) => p.virtual_token_reserves));
-    }
+  // Question de recherche V2 (voir sql/schema.sql, en-tête) : à T+5s/10s/
+  // 20s/30s, quelles caractéristiques de la bonding curve distinguent déjà
+  // B de C ? bc_ratio_tXs/bc_first_active_at_s/bc_peak_ratio sont écrits EN
+  // DIRECT par le listener au fil de la cascade — pas besoin de relire
+  // token_snapshots ici, contrairement à la V1.
+  //
+  // Restreint aux tokens créés APRÈS le hotfix du 2026-08-23 21:21 UTC
+  // (course upsert/cascade corrigée, voir listener.js) : les tokens créés
+  // avant peuvent avoir bc_ratio_t5s/t10s manquants à cause du bug, pas
+  // comparables au reste. Fenêtre surchargeable via V2_ANALYSIS_SINCE
+  // pour rejouer cette section sans republier le code.
+  const v2Since = new Date(process.env.V2_ANALYSIS_SINCE || '2026-08-23T21:21:20Z');
+  const v2Tokens = tokens.filter((t) => t.created_at && new Date(t.created_at) >= v2Since);
+  const v2Groups = groupTokens(v2Tokens);
+  const v2B = v2Groups[1].tokens;
+  const v2C = v2Groups[2].tokens;
+
+  console.log('\n' + '='.repeat(72));
+  console.log(`CASCADE V2 — B vs C depuis ${v2Since.toISOString()} (B n=${v2B.length}, C n=${v2C.length})`);
+  console.log('  bc_ratio_tXs = virtual_sol_reserves observé / initial, à la lecture la');
+  console.log('  plus proche de ce délai nominal. NULL = pas de lecture à ce point (la');
+  console.log('  cascade s\'est arrêtée avant — gate jugé inactif, ou déjà résolu).');
+  console.log('='.repeat(72));
+
+  if (!v2B.length && !v2C.length) {
+    console.log('\nAucun token créé depuis ce hotfix pour le moment — trop tôt.');
   } else {
-    console.log('\nAucun token du groupe B pour le moment — pas de trajectoire à profiler.');
+    const bcGroups = [
+      { label: 'B. progressive [CIBLE]', tokens: v2B },
+      { label: 'C. non-migré [témoin]', tokens: v2C },
+    ];
+    for (const col of ['bc_ratio_t5s', 'bc_ratio_t10s', 'bc_ratio_t20s', 'bc_ratio_t30s']) {
+      printFeatureDistribution(
+        `${col} (couverture entre parenthèses = part des tokens ayant une lecture à ce point)`,
+        bcGroups.map((g) => {
+          const withValue = g.tokens.filter((t) => t[col] !== null && t[col] !== undefined);
+          const coverage = g.tokens.length ? ((withValue.length / g.tokens.length) * 100).toFixed(1) : '0.0';
+          return { label: `${g.label} (${coverage}%)`, values: g.tokens.map((t) => t[col]) };
+        })
+      );
+    }
+    console.log('\n  bc_first_active_at_s (âge en secondes de la 1re lecture jugée active — NULL = jamais détecté actif) :');
+    for (const g of bcGroups) {
+      const active = g.tokens.filter((t) => t.bc_first_active_at_s !== null && t.bc_first_active_at_s !== undefined);
+      const pct = g.tokens.length ? ((active.length / g.tokens.length) * 100).toFixed(1) : '0.0';
+      console.log(`    ${g.label.padEnd(24)} actifs=${active.length}/${g.tokens.length} (${pct}%)  ${fmtDistStats(distStats(active.map((t) => t.bc_first_active_at_s)))}`);
+    }
+    printFeatureDistribution(
+      'bc_peak_ratio (écart max observé par rapport à 1, toutes lectures confondues)',
+      bcGroups.map((g) => ({ label: g.label, values: g.tokens.map((t) => t.bc_peak_ratio) }))
+    );
   }
 
   const log = await fetchAllRows(supabase, 'ingestion_log', 'event_type, at, id', 'id');
