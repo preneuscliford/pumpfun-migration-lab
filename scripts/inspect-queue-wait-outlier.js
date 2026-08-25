@@ -26,6 +26,7 @@ async function main() {
   const { data, error } = await supabase
     .from('token_snapshots')
     .select('id, mint, captured_at, nominal_delay_s, scheduled_at, queued_at, started_at, completed_at, queue_wait_ms, rpc_call_ms')
+    .not('queue_wait_ms', 'is', null) // sans ça, ORDER BY ... DESC remonte les NULL (lignes d'avant l'instrumentation) en premier
     .order('queue_wait_ms', { ascending: false })
     .limit(10);
   if (error) throw new Error(`lecture: ${error.message}`);
