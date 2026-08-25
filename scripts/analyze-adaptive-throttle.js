@@ -47,7 +47,7 @@ async function fetchAllRows(supabase, table, select, orderColumn, applyFilter) {
 // forcées utilisait encore BC_MIN_INTERVAL_MS (trop rapide) au lieu de
 // l'intervalle adaptatif courant. Ce script mesure désormais depuis ce
 // 2e correctif.
-const DEPLOY_AT = new Date(process.env.DEPLOY_AT || '2026-08-24T20:46:32Z');
+const DEPLOY_AT = new Date(process.env.DEPLOY_AT || '2026-08-25T02:36:42Z');
 // Valeur par défaut du garde-fou de délai (BC_DEADLINE_MS) — sert à
 // estimer combien de lectures ont dû passer par lui.
 const BC_DEADLINE_MS = Number(process.env.BC_DEADLINE_MS) || 18_000;
