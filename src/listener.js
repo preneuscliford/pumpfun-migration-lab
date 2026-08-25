@@ -458,18 +458,76 @@ class EventBuffer {
 // captureCascadeRead) pour pouvoir le mesurer après coup sans deviner.
 function createRpcThrottle(minIntervalMs) {
   let queue = Promise.resolve();
-  return function enqueue(fn) {
+  return function enqueue(fn, scheduledAtMs) {
     const queuedAtMs = Date.now();
     const timed = queue.then(async () => {
       const startedAtMs = Date.now();
       const result = await fn();
-      return { result, queueWaitMs: startedAtMs - queuedAtMs, rpcCallMs: Date.now() - startedAtMs };
+      return {
+        result,
+        queueWaitMs: startedAtMs - queuedAtMs,
+        rpcCallMs: Date.now() - startedAtMs,
+        // scheduledAt/queuedAt/startedAt/completedAt (2026-08-25) : fournis
+        // aussi ici, pas seulement par le throttle adaptatif, depuis que
+        // rpcThrottle (bonding curve) est repassé sur cette file simple —
+        // voir le post-mortem sur createAdaptiveBondingCurveThrottle
+        // ci-dessous pour le pourquoi.
+        scheduledAt: scheduledAtMs ?? null,
+        queuedAt: queuedAtMs,
+        startedAt: startedAtMs,
+        completedAt: Date.now(),
+      };
     });
     queue = timed.catch(() => {}).then(() => new Promise((resolve) => setTimeout(resolve, minIntervalMs)));
     return timed;
   };
 }
 
+// ==========================================================================
+// DÉSACTIVÉ le 2026-08-25 (voir main(), rpcThrottle est repassé sur
+// createRpcThrottle ci-dessus) — POST-MORTEM du 3e problème découvert sur
+// ce throttle adaptatif, plus grave que les deux précédents (engorgement à
+// 99%, puis rythme des lectures forcées trop rapide) : une VRAIE divergence
+// de file, avec perte silencieuse de lectures.
+//
+// Preuve (scripts/inspect-queue-wait-outlier.js, ligne réelle en base) :
+// une lecture mise en file (queued_at) à 22:38:37, dispatchée (started_at)
+// seulement à 02:36:35 le lendemain — ~3h58 d'attente RÉELLE, pas un bug
+// de mesure. Le process listener s'auto-relance toutes les ~5h50
+// (MAX_RUNTIME_MS) via process.exit(0), qui tue IMMÉDIATEMENT tout ce qui
+// reste dans `pending` sans le vider ni le journaliser — donc la majorité
+// du retard réel (au-delà de ce qui a eu la chance d'être dispatché dans
+// les quelques secondes entre le déclenchement de l'arrêt et l'exit final)
+// n'apparaît même pas dans token_snapshots : ces lectures n'ont juste
+// jamais eu lieu, silencieusement.
+//
+// Cause racine : le 2e correctif (pacer les lectures forcées au rythme
+// intervalMs courant plutôt qu'à BC_MIN_INTERVAL_MS) était correct dans
+// son principe, mais expose un angle mort — rien ne garantit que le
+// rythme "sûr" choisi par l'AIMD reste AU-DESSUS du débit réel
+// d'arrivée des lectures programmées. Dès qu'un nombre suffisant de
+// faux/vrais signaux de ralentissement pousse intervalMs vers
+// BC_MAX_INTERVAL_MS (3000ms, soit ~0,33 req/s) et l'y maintient — la
+// récupération est lente et additive (BC_INTERVAL_STEP_DOWN_MS=20ms, sous
+// condition d'un palier de BC_CLEAN_STREAK_TO_SPEED_UP=30 lectures propres
+// CONSÉCUTIVES, statistiquement difficile à atteindre avec un taux de
+// signaux mesuré à ~9% même en régime calme) — alors que le débit réel
+// d'arrivée mesuré ailleurs (~1,5-2 req/s) reste largement au-dessus, la
+// file diverge : ce que l'AIMD croit "prudent" n'a aucune garantie
+// d'être "suffisant". L'ancien espacement fixe (300ms, ~3,33 req/s) n'a
+// jamais ce problème car son débit ne descend JAMAIS, quel que soit le
+// signal — c'est précisément pour ça qu'il est resté stable, quoique avec
+// une latence de queue en rafale non bornée (P99=121s, max=145s), sans
+// jamais perdre une seule lecture programmée.
+//
+// Le code ci-dessous est conservé (fonctionnel, testé hors ligne — voir
+// les scénarios AIMD/garde-fou/pacage dans le scratchpad de la session)
+// pour référence en cas de reprise future d'une adaptation plus prudente
+// (ex. surveiller la profondeur de `pending` elle-même comme signal
+// PRIORITAIRE de reprise de vitesse, plutôt que de se fier uniquement à
+// des séries de lectures propres). Pas branché dans main() pour l'instant.
+// ==========================================================================
+//
 // Throttle adaptatif dédié à la bonding curve (2026-08-25) — voir les
 // constantes BC_* juste au-dessus pour le contexte/les chiffres mesurés
 // qui ont motivé ce choix. Seau de jetons (token bucket) : `capacity`
@@ -932,11 +990,16 @@ async function main() {
   const supabaseKey = requireEnv('SUPABASE_SERVICE_KEY');
   const db = createDb(createClient(supabaseUrl, supabaseKey, { auth: { persistSession: false } }));
   const buffer = new EventBuffer(db);
-  // Throttle adaptatif (2026-08-25, voir createAdaptiveBondingCurveThrottle)
-  // — remplace l'espacement fixe à 300ms : accélère quand le RPC absorbe
-  // sans 429, ralentit fort et tout de suite au moindre 429 rencontré, et
-  // garantit un plafond de retard via son garde-fou de délai (BC_DEADLINE_MS).
-  const rpcThrottle = createAdaptiveBondingCurveThrottle();
+  // Espacement fixe (300ms), PAS le throttle adaptatif — désactivé le
+  // 2026-08-25 après avoir confirmé qu'il pouvait diverger (file jamais
+  // vidée, lectures perdues silencieusement à chaque auto-relance du
+  // process) quand son rythme "sûr" retombait sous le débit réel
+  // d'arrivée. Voir le post-mortem complet juste au-dessus de
+  // createAdaptiveBondingCurveThrottle. Cet espacement fixe reste la
+  // configuration validée sans perte sur ~51 000 requêtes (0% d'échec
+  // définitif par 429) — sa seule limite connue (latence de queue en
+  // rafale, P99=121s/max=145s) est préférable à une divergence.
+  const rpcThrottle = createRpcThrottle(BONDING_CURVE_RPC_MIN_INTERVAL_MS);
   // File indépendante pour holders (2026-08-24) : une capture holders ne
   // doit plus jamais retarder une lecture bonding curve, qui reste
   // prioritaire par construction (deux files séparées) plutôt que par
