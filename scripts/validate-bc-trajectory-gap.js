@@ -222,7 +222,14 @@ async function main() {
         if (!s) continue;
         const initSol = initialSolByMint.get(mint);
         const initTok = initialTokenByMint.get(mint);
-        const vTok = Number(s.virtual_token_reserves);
+        // virtual_token_reserves (token_snapshots) est l'entier BRUT décodé
+        // on-chain (base units, 6 décimales pump.fun — voir bondingCurve.js),
+        // alors qu'initial_virtual_token_reserves (tokens) vient tel quel du
+        // message WS PumpPortal, déjà en unités "humaines". Sans cette
+        // division par 1e6, le ratio est faussé d'un facteur ~1e6 — bug
+        // trouvé en relisant les premiers résultats (relDevToken à ~10^6
+        // au lieu d'un ordre de grandeur comparable à relDevSol).
+        const vTok = Number(s.virtual_token_reserves) / 1e6;
         picked.push({
           mint,
           realAge: s._realAge,
