@@ -249,6 +249,7 @@ async function main() {
       stats('écart relatif vToken |Δ|/initial', picked.map((r) => r.relDevToken));
       // Point 4 : distribution brute.
       histogram('distribution écart relatif vSol', picked.map((r) => r.relDevSol));
+      histogram('distribution écart relatif vToken', picked.map((r) => r.relDevToken));
 
       // Point 5 : robustesse — exclut B trop proches de leur completion,
       // et toute lecture à queue_wait_ms élevé (les deux groupes).
