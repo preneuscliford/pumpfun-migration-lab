@@ -102,15 +102,6 @@ const T2_VTOK_REL_DEV_MIN = 0.10;
 const T10_VSOL_PERSISTENCE_MIN = 0.20;
 const SAMPLE_SIZE = Number(process.env.SAMPLE_SIZE) || 3000;
 
-function shuffle(arr) {
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
-
 function isCompletedSnapshot(s) {
   return !!(s.raw_event && s.raw_event.complete === true) || s.virtual_sol_reserves === 0;
 }
@@ -148,32 +139,32 @@ async function main() {
   console.log(`        du 2026-08-26) : capture holders n'aboutit quasiment jamais, donnée`);
   console.log(`        indisponible pour filtrer. Voir HANDOFF.md.`);
 
-  const windowTokens = await fetchAllRows(
-    supabase,
-    'tokens',
-    'mint, created_at, curve_completed_at, initial_virtual_sol_reserves, initial_virtual_token_reserves, raw_new_token_event',
-    'mint',
-    (q) => q.gte('created_at', ANALYSIS_SINCE.toISOString())
-  );
-  console.log(`\nTokens dans la fenêtre : ${windowTokens.length}`);
+  // Requête unique et bornée (pas fetchAllRows) : .range() et .limit() se
+  // marchent dessus dans le client PostgREST. Avec ~90k+ tokens
+  // accumulés, un fetch complet de la fenêtre dépasse le timeout Actions
+  // (vu lors du premier essai de ce script, annulé) — on échantillonne
+  // donc directement dans la requête (ordre par `mint`, quasi aléatoire).
+  // Le filtre créateur (solAmount/initialBuy) s'applique ENSUITE, côté
+  // client, sur cet échantillon déjà borné (pas avant, PostgREST ne
+  // permet pas facilement un filtre numérique fiable sur un champ jsonb
+  // texte sans colonne dédiée).
+  const { data: windowTokens, error: tokensError } = await supabase
+    .from('tokens')
+    .select('mint, created_at, curve_completed_at, initial_virtual_sol_reserves, initial_virtual_token_reserves, raw_new_token_event')
+    .gte('created_at', ANALYSIS_SINCE.toISOString())
+    .order('mint', { ascending: true })
+    .limit(SAMPLE_SIZE);
+  if (tokensError) throw new Error(`lecture tokens: ${tokensError.message}`);
+  console.log(`\nTokens échantillonnés dans la fenêtre : ${windowTokens.length}`);
 
-  // Filtre "gratuit" en amont (pas de fetch de snapshots nécessaire) : les
-  // critères 1 et 2 se lisent directement sur raw_new_token_event. Réduit
-  // fortement la population avant l'étape coûteuse (fetch des snapshots),
-  // sans tirage aléatoire pour ces deux critères (aucun token éligible
-  // n'est perdu). Un échantillonnage n'intervient qu'ensuite, si la
-  // population restante est encore grande, pour borner le coût de la
-  // requête (comme dans describe-bc-t2s-observations.js).
-  const cheapPass = windowTokens.filter((t) => {
+  const tokens = windowTokens.filter((t) => {
     const raw = t.raw_new_token_event;
     if (!raw) return false;
     const sol = Number(raw.solAmount);
     const buy = Number(raw.initialBuy);
     return Number.isFinite(sol) && sol >= CREATOR_SOL_AMOUNT_MIN && Number.isFinite(buy) && buy >= CREATOR_INITIAL_BUY_MIN;
   });
-  console.log(`... après filtre créateur (solAmount/initialBuy, sans fetch snapshots) : ${cheapPass.length}`);
-  const tokens = shuffle(cheapPass).slice(0, SAMPLE_SIZE);
-  console.log(`Échantillon retenu pour l'étape snapshots (bornage coût requête) : ${tokens.length}`);
+  console.log(`... après filtre créateur (solAmount/initialBuy) : ${tokens.length}`);
 
   const createdAtByMint = new Map(tokens.map((t) => [t.mint, Date.parse(t.created_at)]));
   const mints = tokens.map((t) => t.mint);
@@ -206,12 +197,12 @@ async function main() {
 
   // Funnel de filtrage, étape par étape, pour transparence (échantillon
   // attendu petit, voir HANDOFF.md). Les étapes 1/2 (solAmount/initialBuy)
-  // ont déjà été appliquées en amont sur windowTokens/cheapPass (avant
-  // l'échantillonnage) — ici on reconfirme juste sur l'échantillon retenu,
-  // ce qui devrait donner 100% par construction.
+  // ont déjà été appliquées en amont sur l'échantillon de la fenêtre — ici
+  // on reconfirme juste sur les tokens retenus, ce qui devrait donner
+  // 100% par construction.
   const funnel = {
     totalWindow: windowTokens.length,
-    afterCheapFilter: cheapPass.length,
+    afterCheapFilter: tokens.length,
     total: tokens.length,
     hasRawEvent: 0,
     passSolAmount: 0,
