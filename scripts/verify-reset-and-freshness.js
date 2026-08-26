@@ -34,9 +34,13 @@ async function main() {
     console.log(`  ${table.padEnd(20)} : ${n} lignes`);
   }
 
+  // .not('created_at', 'is', null) : en DESC, Postgres met les NULL en
+  // premier par défaut, ce qui fausserait "les plus récents" (même piège
+  // que inspect-queue-wait-outlier.js plus tôt dans la session).
   const { data: newest, error: newestErr } = await supabase
     .from('tokens')
     .select('mint, created_at')
+    .not('created_at', 'is', null)
     .order('created_at', { ascending: false })
     .limit(5);
   if (newestErr) throw new Error(`lecture tokens (newest): ${newestErr.message}`);
@@ -44,6 +48,7 @@ async function main() {
   const { data: oldest, error: oldestErr } = await supabase
     .from('tokens')
     .select('mint, created_at')
+    .not('created_at', 'is', null)
     .order('created_at', { ascending: true })
     .limit(5);
   if (oldestErr) throw new Error(`lecture tokens (oldest): ${oldestErr.message}`);
