@@ -1,0 +1,31 @@
+name: Inspect snapshot FK error (diagnostic, read-only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mint:
+        description: 'Mint to inspect (optional, defaults to the latest error)'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - run: npm ci
+
+      - name: Run diagnostic
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          MINT: ${{ inputs.mint }}
+        run: node scripts/inspect-snapshot-fk-error.js
