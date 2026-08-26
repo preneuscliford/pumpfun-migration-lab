@@ -132,6 +132,10 @@ const LONG_TAIL_DELAYS_S = parseDelaysS(process.env.LONG_TAIL_DELAYS_S, [120, 30
 // séparation nette entre les deux.
 const ACTIVITY_REL_DEV_THRESHOLD = Number(process.env.ACTIVITY_REL_DEV_THRESHOLD) || 1e-4;
 
+// Délai avant une unique retentative d'insertSnapshot après une violation
+// de token_snapshots_mint_fkey (voir captureCascadeRead) — 2026-08-26.
+const INSERT_SNAPSHOT_FK_RETRY_DELAY_MS = Number(process.env.INSERT_SNAPSHOT_FK_RETRY_DELAY_MS) || 1500;
+
 // Espacement minimum entre deux appels RPC bonding-curve/holders, tous
 // tokens confondus — protège le RPC public gratuit d'un afflux de
 // créations groupées plutôt que de compter sur le hasard de l'espacement
@@ -812,7 +816,24 @@ async function captureCascadeRead(
         row.holders_error = err.message;
       }
     }
-    await db.insertSnapshot(row);
+    // Filet de sécurité (2026-08-26) : observé en production, 100% des
+    // insertSnapshot échouant sur token_snapshots_mint_fkey juste après un
+    // reset de la base, y compris pour des tokens vieux de 2s dont l'upsert
+    // dans `tokens` n'avait pourtant renvoyé aucune erreur - cause exacte
+    // non confirmée (écarté : dédoublonnage en mémoire, cache, trigger/RLS
+    // côté DB, connexion figée d'un process long-lived - un process
+    // fraîchement relancé reproduisait quand même le problème). Ressemble à
+    // un aléa de cohérence lecture-après-écriture côté Supabase plutôt qu'à
+    // un bug de logique ici. Une seule retentative après un court délai
+    // absorbe ce cas sans changer le comportement normal (chemin heureux
+    // inchangé, coût nul si insertSnapshot réussit du premier coup).
+    try {
+      await db.insertSnapshot(row);
+    } catch (err) {
+      if (!/token_snapshots_mint_fkey/.test(err.message)) throw err;
+      await new Promise((r) => setTimeout(r, INSERT_SNAPSHOT_FK_RETRY_DELAY_MS));
+      await db.insertSnapshot(row);
+    }
 
     const ratio = initialVSol ? state.virtual_quote_reserves_sol / initialVSol : null;
     await db.updateTokenDerivedMetrics(mint, { ratio, ageSeconds, checkpointColumn: CHECKPOINT_COLUMNS[nominalDelayS] });
