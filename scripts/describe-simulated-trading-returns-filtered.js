@@ -100,6 +100,16 @@ const CREATOR_INITIAL_BUY_MIN = 50_000_000; // tokens
 const T2_VSOL_REL_DEV_MIN = 0.25;
 const T2_VTOK_REL_DEV_MIN = 0.10;
 const T10_VSOL_PERSISTENCE_MIN = 0.20;
+const SAMPLE_SIZE = Number(process.env.SAMPLE_SIZE) || 3000;
+
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
 
 function isCompletedSnapshot(s) {
   return !!(s.raw_event && s.raw_event.complete === true) || s.virtual_sol_reserves === 0;
@@ -138,14 +148,32 @@ async function main() {
   console.log(`        du 2026-08-26) : capture holders n'aboutit quasiment jamais, donnée`);
   console.log(`        indisponible pour filtrer. Voir HANDOFF.md.`);
 
-  const allTokens = await fetchAllRows(
+  const windowTokens = await fetchAllRows(
     supabase,
     'tokens',
     'mint, created_at, curve_completed_at, initial_virtual_sol_reserves, initial_virtual_token_reserves, raw_new_token_event',
-    'mint'
+    'mint',
+    (q) => q.gte('created_at', ANALYSIS_SINCE.toISOString())
   );
-  const tokens = allTokens.filter((t) => t.created_at && new Date(t.created_at) >= ANALYSIS_SINCE);
-  console.log(`\nTokens dans la fenêtre : ${tokens.length}`);
+  console.log(`\nTokens dans la fenêtre : ${windowTokens.length}`);
+
+  // Filtre "gratuit" en amont (pas de fetch de snapshots nécessaire) : les
+  // critères 1 et 2 se lisent directement sur raw_new_token_event. Réduit
+  // fortement la population avant l'étape coûteuse (fetch des snapshots),
+  // sans tirage aléatoire pour ces deux critères (aucun token éligible
+  // n'est perdu). Un échantillonnage n'intervient qu'ensuite, si la
+  // population restante est encore grande, pour borner le coût de la
+  // requête (comme dans describe-bc-t2s-observations.js).
+  const cheapPass = windowTokens.filter((t) => {
+    const raw = t.raw_new_token_event;
+    if (!raw) return false;
+    const sol = Number(raw.solAmount);
+    const buy = Number(raw.initialBuy);
+    return Number.isFinite(sol) && sol >= CREATOR_SOL_AMOUNT_MIN && Number.isFinite(buy) && buy >= CREATOR_INITIAL_BUY_MIN;
+  });
+  console.log(`... après filtre créateur (solAmount/initialBuy, sans fetch snapshots) : ${cheapPass.length}`);
+  const tokens = shuffle(cheapPass).slice(0, SAMPLE_SIZE);
+  console.log(`Échantillon retenu pour l'étape snapshots (bornage coût requête) : ${tokens.length}`);
 
   const createdAtByMint = new Map(tokens.map((t) => [t.mint, Date.parse(t.created_at)]));
   const mints = tokens.map((t) => t.mint);
@@ -177,8 +205,13 @@ async function main() {
   }
 
   // Funnel de filtrage, étape par étape, pour transparence (échantillon
-  // attendu petit, voir HANDOFF.md).
+  // attendu petit, voir HANDOFF.md). Les étapes 1/2 (solAmount/initialBuy)
+  // ont déjà été appliquées en amont sur windowTokens/cheapPass (avant
+  // l'échantillonnage) — ici on reconfirme juste sur l'échantillon retenu,
+  // ce qui devrait donner 100% par construction.
   const funnel = {
+    totalWindow: windowTokens.length,
+    afterCheapFilter: cheapPass.length,
     total: tokens.length,
     hasRawEvent: 0,
     passSolAmount: 0,
@@ -239,7 +272,9 @@ async function main() {
   console.log('\n' + '='.repeat(78));
   console.log('FUNNEL DE FILTRAGE');
   console.log('='.repeat(78));
-  console.log(`  Tokens dans la fenêtre               : ${funnel.total}`);
+  console.log(`  Tokens dans la fenêtre                : ${funnel.totalWindow}`);
+  console.log(`  ... solAmount + initialBuy OK (amont) : ${funnel.afterCheapFilter}`);
+  console.log(`  ... échantillon retenu (bornage coût) : ${funnel.total}`);
   console.log(`  ... avec raw_new_token_event          : ${funnel.hasRawEvent}`);
   console.log(`  ... solAmount >= ${CREATOR_SOL_AMOUNT_MIN} SOL              : ${funnel.passSolAmount}`);
   console.log(`  ... initialBuy >= ${(CREATOR_INITIAL_BUY_MIN / 1e6).toFixed(0)}M tokens        : ${funnel.passInitialBuy}`);

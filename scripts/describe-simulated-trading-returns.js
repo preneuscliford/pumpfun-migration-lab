@@ -79,11 +79,21 @@ function percentile(arr, p) {
 function fmt(v, d = 4) { return v === null || v === undefined || Number.isNaN(v) ? 'n/a' : v.toFixed(d); }
 
 const ANALYSIS_SINCE = new Date(process.env.ANALYSIS_SINCE || '2026-08-23T21:21:20Z');
+const SAMPLE_SIZE = Number(process.env.SAMPLE_SIZE) || 3000;
 const PLATFORM_FEE_PCT = Number(process.env.PLATFORM_FEE_PCT) || 0.01; // par transaction, aller-retour = x2
 const ENTRY_AGE_TARGET_S = 2;
 const ENTRY_AGE_TOLERANCE_S = 3; // un peu plus large pour maximiser la couverture d'entrée
 const EXIT_CHECKPOINTS_S = [5, 10, 20, 30, 60, 120, 300, 600, 1200, 1800];
 const AGE_TOLERANCE_S = { 5: 2, 10: 3, 20: 5, 30: 7, 60: 10, 120: 20, 300: 45, 600: 90, 1200: 180, 1800: 270 };
+
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
 
 function isCompletedSnapshot(s) {
   return !!(s.raw_event && s.raw_event.complete === true) || s.virtual_sol_reserves === 0;
@@ -112,14 +122,16 @@ async function main() {
   console.log(`Frais de plateforme supposés : ${(PLATFORM_FEE_PCT * 100).toFixed(2)}%/transaction, x2 aller-retour`);
   console.log('='.repeat(78));
 
-  const allTokens = await fetchAllRows(
+  const windowTokens = await fetchAllRows(
     supabase,
     'tokens',
     'mint, created_at, curve_completed_at',
-    'mint'
+    'mint',
+    (q) => q.gte('created_at', ANALYSIS_SINCE.toISOString())
   );
-  const tokens = allTokens.filter((t) => t.created_at && new Date(t.created_at) >= ANALYSIS_SINCE);
-  console.log(`\nTokens dans la fenêtre : ${tokens.length}`);
+  console.log(`\nTokens dans la fenêtre : ${windowTokens.length}`);
+  const tokens = shuffle(windowTokens).slice(0, SAMPLE_SIZE);
+  console.log(`Échantillon tiré au hasard pour borner le coût de la requête : ${tokens.length}`);
 
   const createdAtByMint = new Map(tokens.map((t) => [t.mint, Date.parse(t.created_at)]));
   const mints = tokens.map((t) => t.mint);
