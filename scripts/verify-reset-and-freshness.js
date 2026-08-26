@@ -59,6 +59,28 @@ async function main() {
   console.log('\n-- 5 tokens les plus anciens (devrait être juste après le reset) --');
   for (const t of oldest || []) console.log(`  ${t.mint}  created_at=${t.created_at}`);
 
+  // token_snapshots à 0 alors que des tokens vieux de >1min existent est
+  // anormal (le gate universel 2/5/10s devrait déjà avoir produit des
+  // lignes) — on regarde ingestion_log pour voir s'il y a des erreurs
+  // 'bonding_curve_snapshot_error' ou autre chose d'inhabituel.
+  const { data: recentLog, error: logErr } = await supabase
+    .from('ingestion_log')
+    .select('event_type, at, detail')
+    .order('at', { ascending: false })
+    .limit(30);
+  if (logErr) throw new Error(`lecture ingestion_log: ${logErr.message}`);
+
+  console.log('\n-- 30 dernières lignes ingestion_log (event_type) --');
+  const counts = {};
+  for (const l of recentLog || []) counts[l.event_type] = (counts[l.event_type] || 0) + 1;
+  for (const [type, n] of Object.entries(counts)) console.log(`  ${type.padEnd(30)} : ${n}`);
+
+  const errors = (recentLog || []).filter((l) => l.event_type.includes('error'));
+  if (errors.length) {
+    console.log('\n-- Détail des erreurs récentes --');
+    for (const e of errors.slice(0, 5)) console.log(`  [${e.at}] ${e.event_type}: ${e.detail}`);
+  }
+
   if (newest && newest.length) {
     const ageMs = Date.now() - new Date(newest[0].created_at).getTime();
     console.log(`\nÂge du token le plus récent : ${(ageMs / 1000).toFixed(0)}s`);
