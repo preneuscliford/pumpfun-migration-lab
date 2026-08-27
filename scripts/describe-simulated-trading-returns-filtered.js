@@ -176,6 +176,10 @@ async function main() {
     return Number.isFinite(sol) && sol >= CREATOR_SOL_AMOUNT_MIN && Number.isFinite(buy) && buy >= CREATOR_INITIAL_BUY_MIN;
   });
   console.log(`... après filtre créateur (solAmount/initialBuy) : ${tokens.length}`);
+  if (tokens.length) {
+    const agesS = tokens.map((t) => (Date.now() - Date.parse(t.created_at)) / 1000).sort((a, b) => a - b);
+    console.log(`    âge (s) de ces tokens : min=${agesS[0].toFixed(1)} médiane=${agesS[Math.floor(agesS.length / 2)].toFixed(1)} max=${agesS[agesS.length - 1].toFixed(1)}`);
+  }
 
   const createdAtByMint = new Map(tokens.map((t) => [t.mint, Date.parse(t.created_at)]));
   const mints = tokens.map((t) => t.mint);
