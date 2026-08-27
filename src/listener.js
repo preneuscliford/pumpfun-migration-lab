@@ -767,6 +767,14 @@ async function captureCascadeRead(
 ) {
   const ageSeconds = Math.round((Date.now() - createdAtMs) / 1000);
   const scheduledAtMs = createdAtMs + nominalDelayS * 1000;
+  // Instrumentation temporaire (2026-08-27) : le filtre "créateur" (gros
+  // solAmount/initialBuy) montre 0 snapshot ET 0 erreur pour son cohorte
+  // entier, malgré des tokens vieux de jusqu'à 26min - la lecture ne
+  // semble jamais démarrer, pas juste échouer silencieusement. Ce log
+  // confirme si le setTimeout a bien déclenché ce point, avant même
+  // l'appel RPC — permet de distinguer "jamais programmé/déclenché" de
+  // "démarré puis perdu en route". À retirer une fois la cause trouvée.
+  db.logIngestion('cascade_read_started', `${mint} @T+${nominalDelayS}s (age réel ${ageSeconds}s)`).catch(() => {});
   try {
     const {
       result: state,
