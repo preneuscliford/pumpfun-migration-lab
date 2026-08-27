@@ -182,6 +182,10 @@ async function main() {
     const bonkCount = tokens.filter((t) => t.mint.endsWith('bonk')).length;
     const pumpCount = tokens.filter((t) => t.mint.endsWith('pump')).length;
     console.log(`    suffixe mint : .bonk=${bonkCount} .pump=${pumpCount} autre=${tokens.length - bonkCount - pumpCount}`);
+    const midAged = [...tokens].sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+    const sample = [midAged[0], midAged[Math.floor(midAged.length / 2)], midAged[midAged.length - 1]].filter(Boolean);
+    console.log('    exemples de mints (vieux/médian/récent) :');
+    for (const t of sample) console.log(`      ${t.mint}  created_at=${t.created_at}  solAmount=${t.raw_new_token_event.solAmount}  initialBuy=${t.raw_new_token_event.initialBuy}`);
   }
 
   const createdAtByMint = new Map(tokens.map((t) => [t.mint, Date.parse(t.created_at)]));
