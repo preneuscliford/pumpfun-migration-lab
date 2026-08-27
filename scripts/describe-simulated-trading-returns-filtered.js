@@ -143,7 +143,17 @@ async function main() {
   // marchent dessus dans le client PostgREST. Avec ~90k+ tokens
   // accumulés, un fetch complet de la fenêtre dépasse le timeout Actions
   // (vu lors du premier essai de ce script, annulé) — on échantillonne
-  // donc directement dans la requête (ordre par `mint`, quasi aléatoire).
+  // donc directement dans la requête.
+  //
+  // Tri par created_at DESC (2026-08-27, corrigé après remarque
+  // utilisateur) — PAS par `mint` : l'ordre alphabétique des adresses
+  // donnait un sous-ensemble quasi identique à chaque relance, indépendant
+  // du moment où le script tourne. Objectif explicite du reset de base :
+  // suivre des tokens FRAIS à chaque relance, pas rejouer le même
+  // instantané figé. .not('created_at','is',null) : en DESC, Postgres met
+  // les NULL en premier par défaut (même piège que
+  // verify-reset-and-freshness.js plus tôt dans la session).
+  //
   // Le filtre créateur (solAmount/initialBuy) s'applique ENSUITE, côté
   // client, sur cet échantillon déjà borné (pas avant, PostgREST ne
   // permet pas facilement un filtre numérique fiable sur un champ jsonb
@@ -152,7 +162,8 @@ async function main() {
     .from('tokens')
     .select('mint, created_at, curve_completed_at, initial_virtual_sol_reserves, initial_virtual_token_reserves, raw_new_token_event')
     .gte('created_at', ANALYSIS_SINCE.toISOString())
-    .order('mint', { ascending: true })
+    .not('created_at', 'is', null)
+    .order('created_at', { ascending: false })
     .limit(SAMPLE_SIZE);
   if (tokensError) throw new Error(`lecture tokens: ${tokensError.message}`);
   console.log(`\nTokens échantillonnés dans la fenêtre : ${windowTokens.length}`);

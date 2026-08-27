@@ -117,18 +117,30 @@ async function main() {
   // inspect-filter-criteria-availability.js) plutôt que de récupérer toute
   // la fenêtre puis échantillonner côté client : avec ~90k+ tokens
   // accumulés, un fetch complet paginé dépasse le timeout Actions (15min),
-  // vu lors du premier essai de ce script (annulé). L'ordre par `mint`
-  // (adresse pubkey quasi aléatoire, sans corrélation avec nos métriques)
-  // rend ce sous-ensemble effectivement représentatif sans coût de tri
-  // complet côté serveur.
+  // vu lors du premier essai de ce script (annulé).
   // Requête unique et bornée (pas de boucle de pagination fetchAllRows) :
   // .range() (utilisé par fetchAllRows) et .limit() se marchent dessus
   // dans le client PostgREST, donc on fait ici un seul appel direct.
+  //
+  // Tri par created_at DESC (2026-08-27, corrigé après remarque
+  // utilisateur) — PAS par `mint` : trier par mint donnait un sous-ensemble
+  // QUASI IDENTIQUE à chaque relance (ordre alphabétique fixe des adresses,
+  // indépendant du moment où le script tourne), donc chaque exécution
+  // réexaminait presque les mêmes tokens au lieu de suivre l'activité
+  // récente. Objectif explicite du reset de base : observer des tokens
+  // FRAIS à chaque relance sur plusieurs jours, pas rejouer le même
+  // instantané figé. Contrepartie : les tokens les plus récents n'auront
+  // pas encore de lecture aux checkpoints longs (T+1200s/1800s) — normal,
+  // se remplit au fil des relances suivantes.
+  // .not('created_at', 'is', null) : en DESC, Postgres met les NULL en
+  // premier par défaut (même piège que inspect-queue-wait-outlier.js et
+  // verify-reset-and-freshness.js plus tôt dans la session).
   const { data: tokens, error: tokensError } = await supabase
     .from('tokens')
     .select('mint, created_at, curve_completed_at')
     .gte('created_at', ANALYSIS_SINCE.toISOString())
-    .order('mint', { ascending: true })
+    .not('created_at', 'is', null)
+    .order('created_at', { ascending: false })
     .limit(SAMPLE_SIZE);
   if (tokensError) throw new Error(`lecture tokens: ${tokensError.message}`);
   console.log(`\nTokens échantillonnés dans la fenêtre : ${tokens.length}`);
