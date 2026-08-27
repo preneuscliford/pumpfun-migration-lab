@@ -65,6 +65,18 @@ async function main() {
   if (allErrErr) throw new Error(`lecture ingestion_log (filtré): ${allErrErr.message}`);
   console.log(`\nNombre d'erreurs enregistrées pour ce mint : ${(allErrorsForMint || []).length}`);
   for (const e of (allErrorsForMint || []).slice(0, 10)) console.log(`  [${e.at}] ${e.detail}`);
+
+  // Vérification directe token_snapshots (2026-08-27) : requête minimale,
+  // sans passer par fetchSnapshotsForMints/.in(), pour écarter un bug côté
+  // requête des scripts de simulation.
+  const { data: directSnapshots, error: directErr } = await supabase
+    .from('token_snapshots')
+    .select('id, age_seconds, nominal_delay_s, captured_at')
+    .eq('mint', mint)
+    .order('id', { ascending: true });
+  if (directErr) throw new Error(`lecture token_snapshots (direct): ${directErr.message}`);
+  console.log(`\nSnapshots trouvés directement dans token_snapshots pour ce mint : ${(directSnapshots || []).length}`);
+  for (const s of (directSnapshots || []).slice(0, 10)) console.log(`  id=${s.id} age_seconds=${s.age_seconds} nominal_delay_s=${s.nominal_delay_s} captured_at=${s.captured_at}`);
 }
 
 main().catch((err) => {
