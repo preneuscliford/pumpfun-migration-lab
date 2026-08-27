@@ -132,6 +132,30 @@ const LONG_TAIL_DELAYS_S = parseDelaysS(process.env.LONG_TAIL_DELAYS_S, [120, 30
 // séparation nette entre les deux.
 const ACTIVITY_REL_DEV_THRESHOLD = Number(process.env.ACTIVITY_REL_DEV_THRESHOLD) || 1e-4;
 
+// Filtre créateur à la source (2026-08-27, demandé par l'utilisateur) :
+// seuls les deux critères évaluables AU MOMENT de la création (avant toute
+// lecture RPC) — solAmount et initialBuy du créateur, tirés directement du
+// message WS 'create' de PumpPortal. Les autres critères ("validés" par
+// l'expérience de cette session : variation vSol/vToken à T+2s, persistance
+// à T+10s, concentration holders) ne peuvent être évalués qu'APRÈS des
+// lectures RPC — ils restent appliqués a posteriori par
+// scripts/describe-simulated-trading-returns-filtered.js, pas ici. Un token
+// qui ne passe pas ce filtre n'est PAS upserté dans `tokens` et sa cascade
+// n'est PAS programmée : objectif explicite de réduire le volume pour
+// concentrer le budget RPC/Supabase sur le sous-ensemble qui intéresse
+// l'utilisateur, plutôt que de continuer à tout suivre puis filtrer après
+// coup. Unités déjà vérifiées (inspect-filter-criteria-availability.js,
+// 2026-08-26) : solAmount et initialBuy sont en unités humaines dans le
+// message WS, pas de conversion nécessaire.
+const CREATOR_SOL_AMOUNT_MIN = Number(process.env.CREATOR_SOL_AMOUNT_MIN) || 1;
+const CREATOR_INITIAL_BUY_MIN = Number(process.env.CREATOR_INITIAL_BUY_MIN) || 50_000_000;
+
+function passesCreatorFilter(msg) {
+  const sol = Number(msg.solAmount);
+  const buy = Number(msg.initialBuy);
+  return Number.isFinite(sol) && sol >= CREATOR_SOL_AMOUNT_MIN && Number.isFinite(buy) && buy >= CREATOR_INITIAL_BUY_MIN;
+}
+
 // Délai avant une unique retentative d'insertSnapshot après une violation
 // de token_snapshots_mint_fkey (voir captureCascadeRead) — 2026-08-26.
 const INSERT_SNAPSHOT_FK_RETRY_DELAY_MS = Number(process.env.INSERT_SNAPSHOT_FK_RETRY_DELAY_MS) || 1500;
@@ -1064,6 +1088,7 @@ async function main() {
       const nowIso = new Date().toISOString();
       const type = classifyEvent(msg);
       if (type === 'new_token') {
+        if (!passesCreatorFilter(msg)) return; // voir CREATOR_SOL_AMOUNT_MIN/CREATOR_INITIAL_BUY_MIN ci-dessus
         const row = buildTokenRow(msg, nowIso);
         // Upsert immédiat, PAS de mise en buffer (voir EventBuffer) : la
         // cascade ne doit être programmée qu'une fois le token réellement
@@ -1216,6 +1241,7 @@ module.exports = {
   computeRelDev,
   captureCascadeRead,
   scheduleTokenCascade,
+  passesCreatorFilter,
   main,
 };
 
