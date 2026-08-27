@@ -179,6 +179,9 @@ async function main() {
   if (tokens.length) {
     const agesS = tokens.map((t) => (Date.now() - Date.parse(t.created_at)) / 1000).sort((a, b) => a - b);
     console.log(`    âge (s) de ces tokens : min=${agesS[0].toFixed(1)} médiane=${agesS[Math.floor(agesS.length / 2)].toFixed(1)} max=${agesS[agesS.length - 1].toFixed(1)}`);
+    const bonkCount = tokens.filter((t) => t.mint.endsWith('bonk')).length;
+    const pumpCount = tokens.filter((t) => t.mint.endsWith('pump')).length;
+    console.log(`    suffixe mint : .bonk=${bonkCount} .pump=${pumpCount} autre=${tokens.length - bonkCount - pumpCount}`);
   }
 
   const createdAtByMint = new Map(tokens.map((t) => [t.mint, Date.parse(t.created_at)]));
